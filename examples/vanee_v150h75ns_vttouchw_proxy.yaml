@@ -73,43 +73,48 @@ select:
   - platform: template
     name: "ERV Operating Mode"
     id: erv_mode_select
+    icon: "mdi:hvac"
     options:
       - "Standby (OFF)"
       - "Intermittent (Timer)"
-      - "MIN (Continuous Low)"
-      - "MAX (Continuous High)"
-      - "Recirculation"
+      - "Continuous (LOW)"
+      - "Continuous (MED)"
+      - "Continuous (HIGH)"
       - "Turbo / Override"
       - "SMART / Auto"
+      - "Away"
     lambda: |-
       uint8_t m = id(erv_proxy).get_current_mode_byte();
       switch (m) {
         case 0x01: return std::string("Standby (OFF)");
         case 0x08: return std::string("Intermittent (Timer)");
-        case 0x09: return std::string("MIN (Continuous Low)");
-        case 0x0A: return std::string("MAX (Continuous High)");
-        case 0x0B: return std::string("Recirculation");
-        case 0x11: return std::string("Turbo / Override");
-        case 0x14: return std::string("SMART / Auto");
+        case 0x09: return std::string("Continuous (LOW)");
+        case 0x0B: return std::string("Continuous (MED)");
+        case 0x0A: return std::string("Continuous (HIGH)");
+        case 0x0C: return std::string("Turbo / Override");
+        case 0x0F: return std::string("Away");
+        case 0x11: return std::string("SMART / Auto");
         default:   return std::string("Intermittent (Timer)");
       }
-    update_interval: 5s
+    update_interval: 2s
     set_action:
       - lambda: |-
           if (x == "Standby (OFF)") {
             id(erv_proxy).write_mode_from_ha(0x01);
           } else if (x == "Intermittent (Timer)") {
             id(erv_proxy).write_mode_from_ha(0x08);
-          } else if (x == "MIN (Continuous Low)") {
+          } else if (x == "Continuous (LOW)") {
             id(erv_proxy).write_mode_from_ha(0x09);
-          } else if (x == "MAX (Continuous High)") {
-            id(erv_proxy).write_mode_from_ha(0x0A);
-          } else if (x == "Recirculation") {
+          } else if (x == "Continuous (MED)") {
             id(erv_proxy).write_mode_from_ha(0x0B);
+          } else if (x == "Continuous (HIGH)") {
+            id(erv_proxy).write_mode_from_ha(0x0A);
           } else if (x == "Turbo / Override") {
-            id(erv_proxy).write_mode_from_ha(0x11);
+            id(erv_proxy).write_mode_from_ha(0x0C);
+          } else if (x == "Away") {
+            id(erv_proxy).write_mode_from_ha(0x0F);
           } else if (x == "SMART / Auto") {
-            id(erv_proxy).write_mode_from_ha(0x14);
+            id(erv_proxy).write_mode_from_ha(0x11);
           }
 
 number:
@@ -153,6 +158,21 @@ number:
       - lambda: |-
           id(erv_proxy).write_turbo_timeout_hours_from_ha((uint32_t) x);
 
+  - platform: template
+    name: "ERV Fan Speed"
+    id: erv_fan_speed_slider
+    icon: "mdi:fan"
+    min_value: 1
+    max_value: 3
+    step: 1
+    mode: slider
+    lambda: |-
+      return (float) id(erv_proxy).get_fan_speed_level();
+    update_interval: 2s
+    set_action:
+      - lambda: |-
+          id(erv_proxy).write_fan_speed_from_ha((uint8_t) x);
+          
 button:
   - platform: template
     name: "Reset ERV Filter Timer"
