@@ -73,13 +73,51 @@ class BroanErvProxy : public Component {
     return 0x08;
   }
 
+  // Returns unified Fan Speed: 1 = Low, 2 = Medium, 3 = High
+  uint8_t get_fan_speed_level() const {
+    uint8_t m = this->get_current_mode_byte();
+    if (m == 0x09) return 1; // Continuous Low
+    if (m == 0x0B) return 2; // Continuous Medium
+    if (m == 0x0A || m == 0x0C) return 3; // Continuous High or Turbo
+
+    // For Intermittent (0x08) or other modes, read 0x0E22 (0=Low, 1=Med, 2=High)
+    auto it = this->regs_.find(0x0E22);
+    if (it != this->regs_.end() && !it->second.value.empty()) {
+      uint8_t spd = it->second.value[0];
+      if (spd <= 2) return spd + 1;
+    }
+    return 1;
+  }
+
+  void write_fan_speed_from_ha(uint8_t level) {
+    if (level < 1) level = 1;
+    if (level > 3) level = 3;
+    uint8_t m = this->get_current_mode_byte();
+
+    // If currently in a Continuous mode (Low 0x09, Med 0x0B, High 0x0A), switch continuous speed directly
+    if (m == 0x09 || m == 0x0B || m == 0x0A) {
+      uint8_t new_mode = (level == 1) ? 0x09 : ((level == 2) ? 0x0B : 0x0A);
+      ESP_LOGI(TAG, "[HA -> ERV] Changing Continuous Fan Speed to level %u (mode 0x%02X)", level, new_mode);
+      this->enqueue_bus_a_write_(0x0020, {new_mode});
+      this->enqueue_bus_a_write_(0x0820, {0x00});
+      return;
+    }
+
+    // Otherwise, update the Intermittent/Preset fan speed register 0x0E22 (0x00=Low, 0x01=Med, 0x02=High)
+    uint8_t e22_val = level - 1;
+    ESP_LOGI(TAG, "[HA -> ERV] Setting Intermittent Fan Speed 0x0E22 = 0x%02X (level %u)", e22_val, level);
+    this->enqueue_bus_a_write_(0x0322, {0x00});
+    this->enqueue_bus_a_write_(0x0E22, {e22_val});
+    this->enqueue_bus_a_write_(0x0820, {0x00});
+  }
+
   uint32_t get_intermittent_seconds() const {
     auto it = this->regs_.find(0x0222);
     if (it != this->regs_.end() && it->second.value.size() == 4) {
       const auto &v = it->second.value;
       return uint32_t(v[0]) | (uint32_t(v[1]) << 8) | (uint32_t(v[2]) << 16) | (uint32_t(v[3]) << 24);
     }
-    return 2400;
+    return 1800; // Default 30 minutes (1800s)
   }
 
   uint32_t get_humidity_setpoint() const {
@@ -92,8 +130,22 @@ class BroanErvProxy : public Component {
   }
 
   void write_mode_from_ha(uint8_t mode_byte) {
-    if (this->get_current_mode_byte() == mode_byte) return;
-    ESP_LOGI(TAG, "[HA -> ERV] Setting operating mode 0x0020 = 0x%02X", mode_byte);
+    if (mode_byte == 0x0C) {
+      // Turbo / Override mode: write duration to 0x0022 and 0x0C to 0x0020
+      uint32_t sec = this->get_turbo_timeout_hours() * 3600;
+      std::vector<uint8_t> dur_bytes = {
+        static_cast<uint8_t>(sec & 0xFF),
+        static_cast<uint8_t>((sec >> 8) & 0xFF),
+        static_cast<uint8_t>((sec >> 16) & 0xFF),
+        static_cast<uint8_t>((sec >> 24) & 0xFF),
+      };
+      ESP_LOGI(TAG, "[HA -> ERV] Setting Turbo Mode (0x0C) with duration 0x0022 = %u s", (unsigned) sec);
+      this->enqueue_bus_a_write_(0x0020, {0x0C});
+      this->enqueue_bus_a_write_(0x0022, dur_bytes);
+      return;
+    }
+
+    ESP_LOGI(TAG, "[HA -> ERV] Setting Operating Mode 0x0020 = 0x%02X", mode_byte);
     this->enqueue_bus_a_write_(0x0020, {mode_byte});
     this->enqueue_bus_a_write_(0x0820, {0x00});
   }
@@ -102,13 +154,15 @@ class BroanErvProxy : public Component {
     uint32_t sec = minutes_per_hour * 60;
     if (this->get_intermittent_seconds() == sec) return;
     std::vector<uint8_t> bytes = {
-        static_cast<uint8_t>(sec & 0xFF),
-        static_cast<uint8_t>((sec >> 8) & 0xFF),
-        static_cast<uint8_t>((sec >> 16) & 0xFF),
-        static_cast<uint8_t>((sec >> 24) & 0xFF),
+      static_cast<uint8_t>(sec & 0xFF),
+      static_cast<uint8_t>((sec >> 8) & 0xFF),
+      static_cast<uint8_t>((sec >> 16) & 0xFF),
+      static_cast<uint8_t>((sec >> 24) & 0xFF),
     };
     ESP_LOGI(TAG, "[HA -> ERV] Setting intermittent time 0x0222 = %u s (%u min/hr)", (unsigned) sec, (unsigned) minutes_per_hour);
     this->enqueue_bus_a_write_(0x0222, bytes);
+    this->enqueue_bus_a_write_(0x0820, {0x00});
+    this->enqueue_bus_a_write_(0x0322, {0x00});
   }
 
   void write_humidity_setpoint_from_ha(uint32_t rh_percent) {
@@ -122,28 +176,34 @@ class BroanErvProxy : public Component {
     ESP_LOGI(TAG, "[HA -> ERV] Setting humidity setpoint 0x0950 = %u%%", (unsigned) rh_percent);
     this->enqueue_bus_a_write_(0x0950, bytes);
   }
-  
+
   uint32_t get_turbo_timeout_hours() const {
-    auto it = this->regs_.find(0x0330);
+    auto it = this->regs_.find(0x0022);
     if (it != this->regs_.end() && it->second.value.size() == 4) {
       const auto &v = it->second.value;
       uint32_t sec = uint32_t(v[0]) | (uint32_t(v[1]) << 8) | (uint32_t(v[2]) << 16) | (uint32_t(v[3]) << 24);
-      if (sec >= 3600) return sec / 3600;
+      if (sec >= 3600) {
+        uint32_t hrs = (sec + 1800) / 3600;
+        return std::min<uint32_t>(std::max<uint32_t>(hrs, 1), 4);
+      }
     }
-    return 4; // Default to 4 hours if unset
+    return this->turbo_hours_pref_;
   }
 
   void write_turbo_timeout_hours_from_ha(uint32_t hours) {
+    this->turbo_hours_pref_ = hours;
     uint32_t sec = hours * 3600;
     std::vector<uint8_t> bytes = {
-        static_cast<uint8_t>(sec & 0xFF),
-        static_cast<uint8_t>((sec >> 8) & 0xFF),
-        static_cast<uint8_t>((sec >> 16) & 0xFF),
-        static_cast<uint8_t>((sec >> 24) & 0xFF),
+      static_cast<uint8_t>(sec & 0xFF),
+      static_cast<uint8_t>((sec >> 8) & 0xFF),
+      static_cast<uint8_t>((sec >> 16) & 0xFF),
+      static_cast<uint8_t>((sec >> 24) & 0xFF),
     };
-    ESP_LOGI(TAG, "[HA -> ERV] Setting Turbo/Override timeout 0x0330 = %u s (%u h)", (unsigned) sec, (unsigned) hours);
-    this->enqueue_bus_a_write_(0x0330, bytes);
-    this->enqueue_bus_a_write_(0x0430, bytes);
+    ESP_LOGI(TAG, "[HA -> ERV] Setting Turbo/Override duration 0x0022 = %u s (%u h)", (unsigned) sec, (unsigned) hours);
+    this->enqueue_bus_a_write_(0x0022, bytes);
+    if (this->get_current_mode_byte() == 0x0C) {
+      this->enqueue_bus_a_write_(0x0020, {0x0C});
+    }
   }
 
   void reset_filter_timer_from_ha() {
@@ -234,6 +294,7 @@ class BroanErvProxy : public Component {
   uint32_t dynamic_extra_expire_ms_{0};
   std::vector<std::vector<uint16_t>> poll_batches_;
   size_t current_batch_idx_{0};
+  uint32_t turbo_hours_pref_{2};
 
   enum class BusAState {
     LISTEN_FOR_ERV,
@@ -811,7 +872,6 @@ class BroanErvProxy : public Component {
 
       case BusBState::WAIT_PING_REPLY: {
         if (now - this->bus_b_last_ms_ >= 45) {
-          // Alternate rapidly between offering token to 0x12 and pinging 0x12 (plus sweeping 0x11)
           if (this->bus_b_ping_candidate_ == 0x12) {
             this->bus_b_ping_candidate_ = 0x11;
             this->bus_b_state_ = BusBState::DISCOVERY_PING;
@@ -870,7 +930,7 @@ class BroanErvProxy : public Component {
 
   void build_poll_batches_() {
     this->poll_batches_.push_back({
-      0x0020, 0x0120, 0x0220, 0x0620, 0x0720, 0x0820,
+      0x0020, 0x0022, 0x0120, 0x0122, 0x0220, 0x0620, 0x0720, 0x0820,
       0x01E0, 0x0222, 0x0322, 0x0A22, 0x0C22, 0x0E22,
       0x0F22, 0x1022, 0x0830, 0x0930
     });
@@ -913,7 +973,7 @@ class BroanErvProxy : public Component {
 
   void seed_defaults_() {
     seed_reg_(0x0020, {0x08});
-    seed_reg_(0x0022, {});
+    seed_reg_(0x0022, {0x00, 0x00, 0x00, 0x00});
     seed_reg_(0x0030, {0x00});
     seed_reg_(0x0100, {0x01, 0xCC, 0x28});
     seed_reg_(0x0120, {0x08});
