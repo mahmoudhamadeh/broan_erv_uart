@@ -38,6 +38,41 @@ Refer to the wiring schematic below to interconnect your ERV, the dual-bus proxy
 
 ---
 
+## Verified Protocol & Register Map
+
+Through comprehensive register log analysis of the dual-bus proxy intercepting communication between the real VanEE/Broan ERV (Bus A) and the VTTOUCHW wall controller (Bus B), the following live register map has been verified:
+
+| Function / Setting | Register | Type / Format | Description / Notes |
+| :--- | :--- | :--- | :--- |
+| **Base Operating Mode** | `0x0020` | 1 Byte | Active operational state (`0x01` Standby, `0x08` Intermittent, `0x09` Low, `0x0B` Med, `0x0A` High, `0x0C` Turbo, `0x0F` Away, `0x11` SMART/Auto) |
+| **Turbo Timer Duration** | `0x0022` | 4 Bytes (LE) | Active countdown timer in seconds (`3600` = 1h, `7200` = 2h, `14400` = 4h) |
+| **Intermittent Timer Run-Time** | `0x0122` | 4 Bytes (LE) | Active intermittent running duration in seconds (`0x04B0` = 1200s / 20 min) |
+| **Intermittent Schedule** | `0x0222` | 4 Bytes (LE) | Active intermittent schedule configuration / runtime per hour in seconds |
+| **Filter Remaining Timer** | `0x0830` | 4 Bytes (LE) | Remaining countdown seconds until filter maintenance alert |
+| **Humidity Setpoint** | `0x0950` | 4 Bytes (LE) | Target indoor relative humidity threshold (%) |
+| **Cumulative Lifetime Odometer**| `0x1400` | 4 Bytes (LE) | Total machine operational run-time hours |
+| **Supply Airflow CFM** | `0x0510` | Float (IEEE 754) | Real-time live supply blower airflow telemetry |
+| **Exhaust Airflow CFM** | `0x0610` | Float (IEEE 754) | Real-time live exhaust blower airflow telemetry |
+| **Indoor Room Temperature** | `0x0550` | Float (IEEE 754) | Room temperature reading from wall controller sensor |
+| **Indoor Room Humidity** | `0x0450` | Float (IEEE 754) | Room relative humidity reading from wall controller sensor |
+
+---
+
+## Web Interface
+
+The ESPHome embedded **Web Server** is fully enabled, allowing you to monitor real-time CFM airflow telemetry, system diagnostic state, and adjust configuration settings directly from any browser on your local network.
+
+* **Access:** Navigate to `http://<your-esp32-ip>` or the configured mDNS hostname in your browser.
+* **Features:** 
+  * Live gauges and state readouts for supply/exhaust airflow, intake temperatures, and room humidity.
+  * Interactive selectors for operating modes (`Standby`, `Intermittent`, `Continuous Low/Med/High`, `Turbo`, `Away`, `SMART/Auto`).
+  * Direct configuration sliders for intermittent minutes-per-hour, humidity setpoints, and Turbo timer durations.
+
+> ![Web Interface Preview](hardware/web_interface_screenshot.png)
+*(Example view of the ESPHome web dashboard interface controlling the ERV proxy)*
+
+---
+
 ### Understanding the 61 Seeding Register Cache
 
 To keep the `VTTOUCHW` wall controller satisfied and prevent `E50` communication timeouts (~450 ms margin), the proxy initializes with **61 critical register "seeds"** directly in its flash-to-RAM cache. This precise number represents the exact operational footprint of your thermostat:
