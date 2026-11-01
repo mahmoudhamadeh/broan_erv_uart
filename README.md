@@ -250,7 +250,7 @@ Save your custom firmware as `vanee_v150h75ns_vttouchw_proxy.yaml`. Add the dual
 external_components:
   - source:
       type: git
-      url: [https://github.com/mahmoudhamadeh/broan_erv_uart](https://github.com/mahmoudhamadeh/broan_erv_uart)
+      url: https://github.com/mahmoudhamadeh/broan_erv_uart
       ref: vttouchw-dual-bus-proxy
     components: [ broan_erv_proxy ]
 
