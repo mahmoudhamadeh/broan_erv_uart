@@ -101,6 +101,10 @@ Once you deploy the configuration, the proxy will present a tidy control interfa
 * **Maintenance Actions (Configuration Card):** A "Reset ERV Filter Timer" button.
 * **Diagnostics (Diagnostic Card):** A "Dump Proxy Register Cache" trigger to save the runtime cache into memory logs (perfect for identifying and saving unmapped sub-menus to expand `seed_defaults_()`).
 
+<img width="416" height="429" alt="image" src="https://github.com/user-attachments/assets/94aef4d4-5e99-4c58-83a4-a0300ec8fc5d" />
+<img width="417" height="416" alt="image" src="https://github.com/user-attachments/assets/e9eba488-1785-4fa3-a083-6b866e748f0c" />
+<img width="426" height="398" alt="image" src="https://github.com/user-attachments/assets/a6ee21f6-c942-422f-b35d-03ae46cbfa7c" />
+
 ---
 
 ### Configuration Example
