@@ -171,3 +171,131 @@ button:
       name: Filter reset
 
 ```
+
+## Dual-Bus RS485 Proxy (VTTOUCHW to VanEE/Broan AI Series ERV)
+
+This dual-bus proxy enables non-intrusive integration of your VanEE AI Series (or equivalent Broan) ERV with Home Assistant, while **fully preserving** your physical `VTTOUCHW` wall touchscreen controller. 
+
+Because the `VTTOUCHW` and ERV rely on tight, latency-critical, token-based Master/Slave communication over RS485, tapping the bus passively or trying to inject writes will trigger collisions and communication faults (such as `E50` on the wall controller). 
+
+This proxy solves this by acting as an inline "Active Bridge":
+- **Bus A (ERV-facing):** The proxy emulates a Master/Slave controller to read from and write to the physical ERV.
+- **Bus B (Wall Screen-facing):** The proxy emulates the ERV, instantly answering the `VTTOUCHW`’s intense, rapid polling requests.
+- **Bridging:** Environmental readings and commands pass seamlessly between the two buses, while Home Assistant receives and injects sensor data and operations (like custom run timers, humidity targets, or speed toggles) asynchronously.
+
+---
+
+### Hardware Bill of Materials (BOM)
+
+To build the inline proxy, you need the following standard M5Stack hardware:
+
+| Item | Brand / Link | Purpose | GPIO Configuration |
+| :--- | :--- | :--- | :--- |
+| **M5Stack ATOM Lite / AtomS3 Lite** | [M5Stack](https://shop.m5stack.com/products/atoms3-lite-esp32-s3-development-kit) | ESP32-S3 microcontroller executing the proxy logic and hosting ESPHome. | Base for Tail485, Expansion header for Bus B |
+| **ATOM Tail485 Base Module** | [M5Stack](https://shop.m5stack.com/products/atom-tail485) | High-reliability RS485 transceiver for Bus A (to ERV). Includes a DC-DC converter to power the stack. | `GPIO2` (TX), `GPIO1` (RX) |
+| **M5Stack Unit RS485** | [M5Stack](https://shop.m5stack.com/products/rs485-unit) | Compact RS485 transceiver expansion module for Bus B (to VTTOUCHW). | `GPIO5` (TX via G5), `GPIO6` (RX via G6) |
+| **4-Wire Grove Cable / Jumper Wires**| M5Stack | Connects the AtomS3 back header to the RS485 Unit. | Black (GND), Red (5V), Yellow (G5), White (G6) |
+
+---
+
+### Wiring Diagram
+
+Refer to the wiring schematic below to interconnect your ERV, the dual-bus proxy assembly, and the VTTOUCHW wall controller. 
+
+> [!CRITICAL]
+> Remember to wire the `+12V` and `GND` power jumpers between the ATOM Tail485 (Bus A) and M5Stack Unit RS485 (Bus B) terminals. This acts as a daisy-chain, passing 12V power from the ERV directly through to boot the wall controller!
+
+![Wiring Diagram](hardware/wiring_diagram.png)
+
+*   **Primary Bus A (from ERV):** Incoming Red (`+12V`), Black (`GND`), Green (`A / D+`), Yellow (`B / D-`) wires connect to the ATOM Tail485 base terminal block.
+*   **Secondary Bus B (to VTTOUCHW):** Outgoing Red (`+12V`), Black (`GND`), Green (`A / D+`), Yellow (`B / D-`) wires connect from the M5Stack Unit RS485 screw terminal block to the Wall Controller's inputs.
+
+---
+
+### Understanding the 61 Seeding Register Cache
+
+To keep the `VTTOUCHW` wall controller satisfied and prevent `E50` communication timeouts (~450 ms margin), the proxy initializes with **61 critical register "seeds"** directly in its flash-to-RAM cache. This precise number represents the exact operational footprint of your thermostat:
+
+1. **The 41 Routine Operation Registers:** Repeatedly polled for real-time operation (fan speed `0x0020`, indoor RH% `0x0450`, indoor temp `0x0550`, live thermistor `0x01E0`, filters `0x0830`/`0x0930`, and basic state flags).
+2. **The 2 Boot-Only Identification Registers:** `0x0100` (Hardware ID) and `0x0BF0` (Model Family String `"STD"`). Polled exactly once on power-cycle. Pre-seeding prevents "cold boot" misses, ensuring the controller recognizes the ERV immediately.
+3. **The 18 Installer & Balancing Menu Registers:** Dedicated to deep telemetry (fan motors `0x0510`/`0x0610`, calibration indexes `0x1610`/`0x1710`, bounds `0x0422`/`0x0C50`, and event log wipes `0x1600`). Unlocks installer menus instantly without wait stalls.
+
+#### What happens if you hit an unseeded menu?
+If the wall screen queries an address outside the 61-seed baseline:
+1. **Dynamic Holding:** Bus B identifies the cache-miss on a new key and halts response to the VTTOUCHW using `HOLD_FOR_CACHE_MISS`.
+2. **Urgent Acquisition:** Bus A immediately moves the missed register to the top of the queue and fires an query to the physical ERV (takes ~25–60 ms).
+3. **Resolution:** Upon ERV reply, Bus B updates `regs_` and replies to the screen. 
+4. **Failure Safeguard:** If the ERV doesn't reply within 150 ms, the proxy drops the hold and issues a standard placeholder payload (`0x00`) to guarantee the Screen never freezes or faults out.
+
+---
+
+### Home Assistant Integration
+
+Once you deploy the configuration, the proxy will present a tidy control interface in Home Assistant, grouping routine controls together and tucking administrative operations into correct device categories:
+
+* **Environment & Airflow Sensors:** Live CFM readings, actual intake (outdoor) temperature, room temperature, and room humidity.
+* **Maintenance & Lifespan:** An "ERV Filter Remaining" countdown.
+* **Operational Control:** Easily toggle fan speeds, select operating modes (like "Turbo / Override"), adjust intermittent minutes per hour, and edit relative humidity setpoints. 
+* **Turbo / Override Duration:** An interactive slider supporting hours `1h`, `2h`, `3h`, or `4h` to directly match the wall screen overrides.
+* **Maintenance Actions (Configuration Card):** A "Reset ERV Filter Timer" button.
+* **Diagnostics (Diagnostic Card):** A "Dump Proxy Register Cache" trigger to save the runtime cache into memory logs (perfect for identifying and saving unmapped sub-menus to expand `seed_defaults_()`).
+
+---
+
+### Configuration Example
+
+Save your custom firmware as `vanee_v150h75ns_vttouchw_proxy.yaml`. Add the dual-bus components and name/pin assignments:
+
+```yaml
+external_components:
+  - source:
+      type: git
+      url: [https://github.com/mahmoudhamadeh/broan_erv_uart](https://github.com/mahmoudhamadeh/broan_erv_uart)
+      ref: vttouchw-dual-bus-proxy
+    components: [ broan_erv_proxy ]
+
+# Dual-Bus UART setup
+uart:
+  - id: bus_a_erv
+    tx_pin: GPIO2   # UART TX (Tail485 to ERV)
+    rx_pin: GPIO1   # UART RX
+    baud_rate: 38400
+    stop_bits: 1
+  - id: bus_b_wall
+    tx_pin: GPIO5   # Back pin G5 (Unit RS485 to Screen)
+    rx_pin: GPIO6   # Back pin G6
+    baud_rate: 38400
+    stop_bits: 1
+
+broan_erv_proxy:
+  id: erv_proxy
+  uart_erv: bus_a_erv
+  uart_wall: bus_b_wall
+
+  # Airflows (High-priority Order)
+  supply_cfm:
+    name: "1. ERV Supply Airflow"
+    icon: "mdi:fan-chevron-up"
+  exhaust_cfm:
+    name: "2. ERV Exhaust Airflow"
+    icon: "mdi:fan-chevron-down"
+
+  # Intake Thermistor
+  erv_temperature:
+    name: "3. ERV Intake Temperature"
+    icon: "mdi:thermometer-chevron-down"
+
+  # VTTOUCHW Wall Screen readings
+  wall_temperature:
+    name: "4. VTTOUCHW Room Temperature"
+    icon: "mdi:home-thermometer-outline"
+  wall_humidity:
+    name: "5. VTTOUCHW Room Humidity"
+    icon: "mdi:water-percent"
+
+  # Maintenance
+  filter_remaining_days:
+    name: "6. ERV Filter Remaining"
+    icon: "mdi:air-filter"
+	
+```

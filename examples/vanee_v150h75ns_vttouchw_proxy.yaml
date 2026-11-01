@@ -1,0 +1,171 @@
+esphome:
+  name: vttouchw-stage1
+  friendly_name: "VanEE V150H75NS ERV Proxy"
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+  hardware_uart: USB_SERIAL_JTAG
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+ota:
+  - platform: esphome
+
+api:
+
+web_server:
+  port: 80
+
+external_components:
+  - source:
+      type: local
+      path: my_components
+
+uart:
+  # Bus A: Real VanEE ERV (via ATOM Tail485 base module)
+  - id: bus_a_erv
+    tx_pin: GPIO2
+    rx_pin: GPIO1
+    baud_rate: 38400
+    rx_buffer_size: 2048
+
+  # Bus B: VTTOUCHW Wall Controller (via Unit RS485 on back header)
+  - id: bus_b_wall
+    tx_pin: GPIO5
+    rx_pin: GPIO6
+    baud_rate: 38400
+    rx_buffer_size: 2048
+
+broan_erv_proxy:
+  id: erv_proxy
+  uart_erv: bus_a_erv
+  uart_wall: bus_b_wall
+  supply_cfm:
+    name: "ERV Supply Airflow"
+    icon: "mdi:fan-chevron-up"
+  exhaust_cfm:
+    name: "ERV Exhaust Airflow"
+    icon: "mdi:fan-chevron-down"
+
+  erv_temperature:
+    name: "ERV Intake Temperature"
+    icon: "mdi:thermometer-chevron-down"
+
+  wall_temperature:
+    name: "Room Temperature"
+    icon: "mdi:home-thermometer-outline"
+  wall_humidity:
+    name: "Room Humidity"
+    icon: "mdi:water-percent"
+
+  filter_remaining_days:
+    name: "ERV Filter Remaining"
+    icon: "mdi:air-filter"
+
+select:
+  - platform: template
+    name: "ERV Operating Mode"
+    id: erv_mode_select
+    options:
+      - "Standby (OFF)"
+      - "Intermittent (Timer)"
+      - "MIN (Continuous Low)"
+      - "MAX (Continuous High)"
+      - "Recirculation"
+      - "Turbo / Override"
+      - "SMART / Auto"
+    lambda: |-
+      uint8_t m = id(erv_proxy).get_current_mode_byte();
+      switch (m) {
+        case 0x01: return std::string("Standby (OFF)");
+        case 0x08: return std::string("Intermittent (Timer)");
+        case 0x09: return std::string("MIN (Continuous Low)");
+        case 0x0A: return std::string("MAX (Continuous High)");
+        case 0x0B: return std::string("Recirculation");
+        case 0x11: return std::string("Turbo / Override");
+        case 0x14: return std::string("SMART / Auto");
+        default:   return std::string("Intermittent (Timer)");
+      }
+    update_interval: 5s
+    set_action:
+      - lambda: |-
+          if (x == "Standby (OFF)") {
+            id(erv_proxy).write_mode_from_ha(0x01);
+          } else if (x == "Intermittent (Timer)") {
+            id(erv_proxy).write_mode_from_ha(0x08);
+          } else if (x == "MIN (Continuous Low)") {
+            id(erv_proxy).write_mode_from_ha(0x09);
+          } else if (x == "MAX (Continuous High)") {
+            id(erv_proxy).write_mode_from_ha(0x0A);
+          } else if (x == "Recirculation") {
+            id(erv_proxy).write_mode_from_ha(0x0B);
+          } else if (x == "Turbo / Override") {
+            id(erv_proxy).write_mode_from_ha(0x11);
+          } else if (x == "SMART / Auto") {
+            id(erv_proxy).write_mode_from_ha(0x14);
+          }
+
+number:
+  - platform: template
+    name: "ERV Intermittent Mins Per Hour"
+    min_value: 10
+    max_value: 55
+    step: 5
+    unit_of_measurement: "min/hr"
+    lambda: |-
+      return (float)(id(erv_proxy).get_intermittent_seconds() / 60);
+    update_interval: 10s
+    set_action:
+      - lambda: |-
+          id(erv_proxy).write_intermittent_minutes_from_ha((uint32_t) x);
+
+  - platform: template
+    name: "ERV Humidity Setpoint"
+    min_value: 20
+    max_value: 60
+    step: 1
+    unit_of_measurement: "%"
+    lambda: |-
+      return (float) id(erv_proxy).get_humidity_setpoint();
+    update_interval: 10s
+    set_action:
+      - lambda: |-
+          id(erv_proxy).write_humidity_setpoint_from_ha((uint32_t) x);
+
+  - platform: template
+    name: "ERV Turbo Override Duration"
+    icon: "mdi:timer-outline"
+    min_value: 1
+    max_value: 4
+    step: 1
+    unit_of_measurement: "h"
+    lambda: |-
+      return (float) id(erv_proxy).get_turbo_timeout_hours();
+    update_interval: 10s
+    set_action:
+      - lambda: |-
+          id(erv_proxy).write_turbo_timeout_hours_from_ha((uint32_t) x);
+
+button:
+  - platform: template
+    name: "Reset ERV Filter Timer"
+    icon: "mdi:air-filter"
+    entity_category: "config"
+    on_press:
+      - lambda: |-
+          id(erv_proxy).reset_filter_timer_from_ha();
+
+  - platform: template
+    name: "Dump Proxy Register Cache"
+    icon: "mdi:database-export"
+    entity_category: "diagnostic"
+    on_press:
+      - lambda: |-
+          id(erv_proxy).dump_status();
