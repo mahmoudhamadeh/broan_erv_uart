@@ -123,7 +123,8 @@ broan_erv_proxy:
   filter_remaining_days:
     name: "6. ERV Filter Remaining"
     icon: "mdi:air-filter"
-	
+
+```
 
 # Broan ERV serial component
 
