@@ -8,6 +8,7 @@
 #include "esphome/components/sensor/sensor.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -24,7 +25,7 @@ struct RegisterRecord {
   uint16_t key{0};
   std::vector<uint8_t> value;
   bool fetched_from_erv{false};
-  uint32_t last_erv_update_ms{0};
+  bool seeded{false};   // value came from seed_defaults_(), not from a cache-miss placeholder
   uint32_t read_count_wall{0};
   uint32_t write_count_wall{0};
 };
@@ -52,6 +53,7 @@ class BroanErvProxy : public Component {
   void set_filter_days_sensor(sensor::Sensor *s) { this->filter_days_sensor_ = s; }
 
   void setup() override {
+    this->boot_.t0 = millis();
     this->high_freq_.start();
     this->seed_defaults_();
     this->build_poll_batches_();
@@ -73,6 +75,34 @@ class BroanErvProxy : public Component {
     return 0x08;
   }
 
+  // Modes a user can pick on the screen (or in HA).
+  static bool is_selectable_mode(uint8_t m) {
+    return m == 0x01 || m == 0x08 || m == 0x09 || m == 0x0A || m == 0x0B || m == 0x0C || m == 0x0F || m == 0x11;
+  }
+
+  // The mode the user selected. While the ERV runs an automatic state instead (0x14 starting up,
+  // 0x0D dehumidifying, 0x0E humidistat hold), 0x0020 shows that state; the selected mode is then
+  // taken from 0x0220 (the mode the ERV returns to, seen during turbo) if it holds a selectable mode.
+  // Returns 0 when neither register holds one (caller keeps showing the last known mode).
+  uint8_t get_selected_mode_byte() const {
+    uint8_t m = this->get_current_mode_byte();
+    if (is_selectable_mode(m)) return m;
+    uint8_t base = this->get_u8_reg_(0x0220);
+    return is_selectable_mode(base) ? base : 0;
+  }
+
+  // Raw fan state reported by the ERV (0x0720): 0 = stopped, 1 = LOW, 4 = MED, 2 = HIGH, 3 = TURBO.
+  uint8_t get_fan_state() const {
+    auto it = this->regs_.find(0x0720);
+    return (it != this->regs_.end() && !it->second.value.empty()) ? it->second.value[0] : 0x00;
+  }
+
+  // True when HA's Fan Speed slider does something in the current mode (Intermittent or Continuous).
+  bool fan_speed_adjustable() const {
+    uint8_t m = this->get_current_mode_byte();
+    return m == 0x08 || m == 0x09 || m == 0x0A || m == 0x0B;
+  }
+
   // Returns unified Fan Speed: 1 = Low, 2 = Medium, 3 = High
   uint8_t get_fan_speed_level() const {
     uint8_t m = this->get_current_mode_byte();
@@ -80,13 +110,50 @@ class BroanErvProxy : public Component {
     if (m == 0x0B) return 2; // Continuous Medium
     if (m == 0x0A || m == 0x0C) return 3; // Continuous High or Turbo
 
-    // For Intermittent (0x08) or other modes, read 0x0E22 (0=Low, 1=Med, 2=High)
+    // SMART, Away, OFF: the ERV picks the speed itself, so show what it is actually running,
+    // from the fan state 0x0720 (1=LOW, 4=MED, 2=HIGH, 3=TURBO, 0=stopped).
+    if (m != 0x08) {
+      auto st = this->regs_.find(0x0720);
+      if (st != this->regs_.end() && !st->second.value.empty()) {
+        switch (st->second.value[0]) {
+          case 0x01: return 1;
+          case 0x04: return 2;
+          case 0x02: case 0x03: return 3;
+          default: break;
+        }
+      }
+      return 1;   // stopped (slider minimum)
+    }
+
+    // Intermittent speed 0x0E22 uses the same order as the mode bytes 09/0A/0B (LOW/HIGH/MED):
+    //   0x00 = LOW, 0x01 = HIGH, 0x02 = MED   (i.e. 0x0E22 == continuous mode byte - 0x09)
+    // Evidence: 0E22=01 runs at the same ~85 CFM as Continuous HIGH, and the ERV reports
+    // 0x0720=02 (HIGH) while in INT with 0E22=01.
     auto it = this->regs_.find(0x0E22);
     if (it != this->regs_.end() && !it->second.value.empty()) {
       uint8_t spd = it->second.value[0];
-      if (spd <= 2) return spd + 1;
+      if (spd == 0x00) return 1; // Low
+      if (spd == 0x02) return 2; // Med
+      if (spd == 0x01) return 3; // High
     }
     return 1;
+  }
+
+  uint32_t get_intermittent_seconds() const { return this->get_u32_reg_(0x0222, 1800); }
+  // Humidity control, as the VTTOUCHW writes it (captured 2026-11-02 10:48 and 11:31):
+  //   0x0A22 and 0x0C22 = setpoint, float %RH (the screen always writes both, same value)
+  //   0x0F22 = 01 when "DEHUM." is selected
+  //   0x1022 = 01 when "HUMIDISTAT" is selected
+  //   both 00 = humidity control off
+  // Observed ERV modes: 0x0D = dehumidifying (fan forced to HIGH while RH > setpoint),
+  // 0x0E = humidistat active (fans stopped while RH > setpoint). 0x0950 (int 40) is unrelated.
+  enum HumidityMode : uint8_t { HUMIDITY_OFF = 0, HUMIDITY_DEHUM = 1, HUMIDITY_HUMIDISTAT = 2 };
+
+  float get_humidity_setpoint() const { return this->get_f32_reg_(0x0A22, 40.0f); }
+  uint8_t get_humidity_mode() const {
+    if (this->get_u8_reg_(0x0F22)) return HUMIDITY_DEHUM;
+    if (this->get_u8_reg_(0x1022)) return HUMIDITY_HUMIDISTAT;
+    return HUMIDITY_OFF;
   }
 
   void write_fan_speed_from_ha(uint8_t level) {
@@ -94,7 +161,7 @@ class BroanErvProxy : public Component {
     if (level > 3) level = 3;
     uint8_t m = this->get_current_mode_byte();
 
-    // If currently in a Continuous mode (Low 0x09, Med 0x0B, High 0x0A), switch continuous speed directly
+    // If currently in a Continuous mode, switch continuous speed directly
     if (m == 0x09 || m == 0x0B || m == 0x0A) {
       uint8_t new_mode = (level == 1) ? 0x09 : ((level == 2) ? 0x0B : 0x0A);
       ESP_LOGI(TAG, "[HA -> ERV] Changing Continuous Fan Speed to level %u (mode 0x%02X)", level, new_mode);
@@ -103,45 +170,44 @@ class BroanErvProxy : public Component {
       return;
     }
 
-    // Otherwise, update the Intermittent/Preset fan speed register 0x0E22 (0x00=Low, 0x01=Med, 0x02=High)
-    uint8_t e22_val = level - 1;
+    // Only Intermittent has a stored speed to change. In SMART / Away / Turbo / OFF the ERV decides the
+    // speed; writing 0x0E22 there would silently change the Intermittent preset instead.
+    if (m != 0x08) {
+      ESP_LOGW(TAG, "[HA -> ERV] Fan speed is set by the ERV in mode 0x%02X; ignoring level %u", m, level);
+      return;
+    }
+
+    // Map level (1=Low, 2=Med, 3=High) to 0x0E22 (0x00=Low, 0x02=Med, 0x01=High), see get_fan_speed_level()
+    uint8_t e22_val = (level == 1) ? 0x00 : ((level == 2) ? 0x02 : 0x01);
     ESP_LOGI(TAG, "[HA -> ERV] Setting Intermittent Fan Speed 0x0E22 = 0x%02X (level %u)", e22_val, level);
     this->enqueue_bus_a_write_(0x0322, {0x00});
     this->enqueue_bus_a_write_(0x0E22, {e22_val});
+    this->enqueue_bus_a_write_(0x0222, u32_le_(this->get_intermittent_seconds()));
+    this->enqueue_bus_a_write_(0x0020, {0x08});
     this->enqueue_bus_a_write_(0x0820, {0x00});
-  }
-
-  uint32_t get_intermittent_seconds() const {
-    auto it = this->regs_.find(0x0222);
-    if (it != this->regs_.end() && it->second.value.size() == 4) {
-      const auto &v = it->second.value;
-      return uint32_t(v[0]) | (uint32_t(v[1]) << 8) | (uint32_t(v[2]) << 16) | (uint32_t(v[3]) << 24);
-    }
-    return 1800; // Default 30 minutes (1800s)
-  }
-
-  uint32_t get_humidity_setpoint() const {
-    auto it = this->regs_.find(0x0950);
-    if (it != this->regs_.end() && it->second.value.size() == 4) {
-      const auto &v = it->second.value;
-      return uint32_t(v[0]) | (uint32_t(v[1]) << 8) | (uint32_t(v[2]) << 16) | (uint32_t(v[3]) << 24);
-    }
-    return 40;
   }
 
   void write_mode_from_ha(uint8_t mode_byte) {
     if (mode_byte == 0x0C) {
-      // Turbo / Override mode: write duration to 0x0022 and 0x0C to 0x0020
       uint32_t sec = this->get_turbo_timeout_hours() * 3600;
-      std::vector<uint8_t> dur_bytes = {
-        static_cast<uint8_t>(sec & 0xFF),
-        static_cast<uint8_t>((sec >> 8) & 0xFF),
-        static_cast<uint8_t>((sec >> 16) & 0xFF),
-        static_cast<uint8_t>((sec >> 24) & 0xFF),
-      };
+      const auto dur_bytes = u32_le_(sec);
       ESP_LOGI(TAG, "[HA -> ERV] Setting Turbo Mode (0x0C) with duration 0x0022 = %u s", (unsigned) sec);
       this->enqueue_bus_a_write_(0x0020, {0x0C});
       this->enqueue_bus_a_write_(0x0022, dur_bytes);
+      return;
+    }
+
+    if (mode_byte == 0x08) {
+      uint32_t sec = this->get_intermittent_seconds();
+      const auto t_bytes = u32_le_(sec);
+      // Same final frame the VTTOUCHW sends when you pick Intermittent: 0222, 0322, 0020, 0820.
+      // (The screen sets the speed in a separate, earlier 0322+0E22 write.) 0x0E22 is left
+      // untouched here, so the stored intermittent speed is kept; HA changes it via Fan Speed.
+      ESP_LOGI(TAG, "[HA -> ERV] Setting Intermittent Mode (0x08) with time=%us", (unsigned) sec);
+      this->enqueue_bus_a_write_(0x0222, t_bytes);
+      this->enqueue_bus_a_write_(0x0322, {0x00});
+      this->enqueue_bus_a_write_(0x0020, {0x08});
+      this->enqueue_bus_a_write_(0x0820, {0x00});
       return;
     }
 
@@ -153,52 +219,46 @@ class BroanErvProxy : public Component {
   void write_intermittent_minutes_from_ha(uint32_t minutes_per_hour) {
     uint32_t sec = minutes_per_hour * 60;
     if (this->get_intermittent_seconds() == sec) return;
-    std::vector<uint8_t> bytes = {
-      static_cast<uint8_t>(sec & 0xFF),
-      static_cast<uint8_t>((sec >> 8) & 0xFF),
-      static_cast<uint8_t>((sec >> 16) & 0xFF),
-      static_cast<uint8_t>((sec >> 24) & 0xFF),
-    };
+    const auto bytes = u32_le_(sec);
     ESP_LOGI(TAG, "[HA -> ERV] Setting intermittent time 0x0222 = %u s (%u min/hr)", (unsigned) sec, (unsigned) minutes_per_hour);
     this->enqueue_bus_a_write_(0x0222, bytes);
     this->enqueue_bus_a_write_(0x0820, {0x00});
     this->enqueue_bus_a_write_(0x0322, {0x00});
+    if (this->get_current_mode_byte() == 0x08) {
+      this->enqueue_bus_a_write_(0x0020, {0x08});
+    }
   }
 
-  void write_humidity_setpoint_from_ha(uint32_t rh_percent) {
-    if (this->get_humidity_setpoint() == rh_percent) return;
-    std::vector<uint8_t> bytes = {
-        static_cast<uint8_t>(rh_percent & 0xFF),
-        static_cast<uint8_t>((rh_percent >> 8) & 0xFF),
-        static_cast<uint8_t>((rh_percent >> 16) & 0xFF),
-        static_cast<uint8_t>((rh_percent >> 24) & 0xFF),
-    };
-    ESP_LOGI(TAG, "[HA -> ERV] Setting humidity setpoint 0x0950 = %u%%", (unsigned) rh_percent);
-    this->enqueue_bus_a_write_(0x0950, bytes);
+  void write_humidity_setpoint_from_ha(float rh_percent) {
+    if (std::fabs(this->get_humidity_setpoint() - rh_percent) < 0.5f) return;
+    const auto bytes = f32_le_(rh_percent);
+    ESP_LOGI(TAG, "[HA -> ERV] Setting humidity setpoint 0x0A22/0x0C22 = %.0f%%", rh_percent);
+    this->enqueue_bus_a_write_(0x0A22, bytes);
+    this->enqueue_bus_a_write_(0x0C22, bytes);
+  }
+
+  void write_humidity_mode_from_ha(uint8_t mode) {
+    // Same four writes the screen sends when you save its Humidity Control page.
+    static const char *const NAMES[] = {"OFF", "DEHUM", "HUMIDISTAT"};
+    if (mode > HUMIDITY_HUMIDISTAT) mode = HUMIDITY_OFF;
+    const auto sp = f32_le_(this->get_humidity_setpoint());
+    ESP_LOGI(TAG, "[HA -> ERV] Humidity control %s", NAMES[mode]);
+    this->enqueue_bus_a_write_(0x0A22, sp);
+    this->enqueue_bus_a_write_(0x0C22, sp);
+    this->enqueue_bus_a_write_(0x0F22, {static_cast<uint8_t>(mode == HUMIDITY_DEHUM ? 0x01 : 0x00)});
+    this->enqueue_bus_a_write_(0x1022, {static_cast<uint8_t>(mode == HUMIDITY_HUMIDISTAT ? 0x01 : 0x00)});
   }
 
   uint32_t get_turbo_timeout_hours() const {
-    auto it = this->regs_.find(0x0022);
-    if (it != this->regs_.end() && it->second.value.size() == 4) {
-      const auto &v = it->second.value;
-      uint32_t sec = uint32_t(v[0]) | (uint32_t(v[1]) << 8) | (uint32_t(v[2]) << 16) | (uint32_t(v[3]) << 24);
-      if (sec >= 3600) {
-        uint32_t hrs = (sec + 1800) / 3600;
-        return std::min<uint32_t>(std::max<uint32_t>(hrs, 1), 4);
-      }
-    }
+    uint32_t sec = this->get_u32_reg_(0x0022);
+    if (sec >= 3600) return std::min<uint32_t>((sec + 1800) / 3600, 4);
     return this->turbo_hours_pref_;
   }
 
   void write_turbo_timeout_hours_from_ha(uint32_t hours) {
     this->turbo_hours_pref_ = hours;
     uint32_t sec = hours * 3600;
-    std::vector<uint8_t> bytes = {
-      static_cast<uint8_t>(sec & 0xFF),
-      static_cast<uint8_t>((sec >> 8) & 0xFF),
-      static_cast<uint8_t>((sec >> 16) & 0xFF),
-      static_cast<uint8_t>((sec >> 24) & 0xFF),
-    };
+    const auto bytes = u32_le_(sec);
     ESP_LOGI(TAG, "[HA -> ERV] Setting Turbo/Override duration 0x0022 = %u s (%u h)", (unsigned) sec, (unsigned) hours);
     this->enqueue_bus_a_write_(0x0022, bytes);
     if (this->get_current_mode_byte() == 0x0C) {
@@ -206,19 +266,26 @@ class BroanErvProxy : public Component {
     }
   }
 
+  // Same sequence the screen sends for a filter reset (captured 2026-11-02 10:50):
+  // 0x0930 = filter interval (s), then 0x0130 = 1 (reset trigger), then 0x0830 = interval (time remaining).
   void reset_filter_timer_from_ha() {
-    uint32_t reset_sec = this->get_u32_reg_(0x0930, 7776000);
-    std::vector<uint8_t> bytes = {
-        static_cast<uint8_t>(reset_sec & 0xFF),
-        static_cast<uint8_t>((reset_sec >> 8) & 0xFF),
-        static_cast<uint8_t>((reset_sec >> 16) & 0xFF),
-        static_cast<uint8_t>((reset_sec >> 24) & 0xFF),
-    };
-    ESP_LOGI(TAG, "[HA -> ERV] Resetting filter remaining timer 0x0830 to %u s", (unsigned) reset_sec);
+    uint32_t interval = this->get_u32_reg_(0x0930, 7776000);
+    const auto bytes = u32_le_(interval);
+    ESP_LOGI(TAG, "[HA -> ERV] Resetting filter timer to %u s (%.0f days)", (unsigned) interval, interval / 86400.0f);
+    this->enqueue_bus_a_write_(0x0930, bytes);
+    this->enqueue_bus_a_write_(0x0130, {0x01});
     this->enqueue_bus_a_write_(0x0830, bytes);
   }
 
-  void dump_status() { this->print_summary_(millis(), true); }
+  // Register dump, printed a few lines per loop so it never stalls the buses (a one-shot dump of
+  // ~70 registers blocked the loop for 100+ ms, close to the screen's ~450 ms reply timeout).
+  void dump_status() {
+    this->print_summary_();
+    this->print_boot_report_();
+    ESP_LOGI(TAG, "================ PROXY REGISTER DUMP (%u regs) ================", (unsigned) this->regs_.size());
+    this->dump_active_ = true;
+    this->dump_next_key_ = 0;
+  }
 
   void loop() override {
     const uint32_t now = millis();
@@ -251,7 +318,13 @@ class BroanErvProxy : public Component {
     }
     this->process_rx_b_(now);
 
-    if (!this->pending_tx_b_.empty() && (now >= this->tx_ready_b_ms_)) {
+    // Listen before talk: never start a frame while the VTTOUCHW is still sending one
+    // (that collision is what corrupts its frames and makes it fall back to Ping re-discovery).
+    bool bus_b_busy = this->uart_b_->available() > 0 || !this->rx_buf_b_.empty() ||
+                      (millis() - this->last_rx_b_ms_ < 3);
+    if (!this->pending_tx_b_.empty() && (now >= this->tx_ready_b_ms_) &&
+        (!bus_b_busy || now - this->tx_ready_b_ms_ > 100)) {
+      if (bus_b_busy) ESP_LOGW(TAG, "[Bus B] Line still busy after 100 ms, sending anyway");
       this->uart_b_->write_array(this->pending_tx_b_);
       this->uart_b_->flush();
       uint32_t done_ms = millis();
@@ -271,8 +344,10 @@ class BroanErvProxy : public Component {
     // ---- Periodic 15s Status Line ----
     if (now - this->last_summary_ms_ >= 15000) {
       this->last_summary_ms_ = now;
-      this->print_summary_(now, false);
+      this->print_summary_();
     }
+
+    if (this->dump_active_) this->dump_some_registers_();
   }
 
  protected:
@@ -289,7 +364,14 @@ class BroanErvProxy : public Component {
 
   std::map<uint16_t, RegisterRecord> regs_;
   std::deque<PendingWrite> bus_a_write_queue_;
+  // While a write to `key` is in progress, ERV read replies that still carry the old value are
+  // ignored. The ERV acknowledges a write immediately but applies it 100-450 ms later (measured on
+  // the user's unit), so the guard lasts until the ERV reports the written value, with a deadline:
+  // 3 s while queued, then 1.5 s after the ERV's ack. After the deadline the ERV's value wins.
+  struct WriteGuard { uint32_t deadline; std::vector<uint8_t> expect; };
+  std::map<uint16_t, WriteGuard> write_guard_;
   std::set<uint16_t> urgent_poll_keys_;
+  std::set<uint16_t> refresh_keys_;   // re-read right after an acknowledged write
   std::set<uint16_t> dynamic_extra_keys_;
   uint32_t dynamic_extra_expire_ms_{0};
   std::vector<std::vector<uint16_t>> poll_batches_;
@@ -341,6 +423,21 @@ class BroanErvProxy : public Component {
   uint32_t bus_b_rx_bytes_{0};
   uint32_t bus_b_echoes_{0};
   uint32_t bus_b_cache_misses_{0};
+  uint32_t bus_b_offer_ms_{0};
+  uint32_t bus_b_accept_max_ms_{0};   // slowest token accept since the last status line
+  uint32_t bus_b_accept_late_{0};     // accepts slower than 50 ms since the last status line
+  uint32_t bus_b_holds_{0};           // cache-miss holds since the last status line
+  uint32_t bus_b_hold_max_ms_{0};     // longest of them
+  uint32_t bus_b_hold_timeouts_{0};   // holds that ended without the ERV's answer
+
+  // Boot milestones. Logged on every status line for the first 3 minutes (and in the register dump),
+  // because the log viewer usually connects a few seconds after boot and misses the live lines.
+  struct BootReport {
+    uint32_t t0{0}, erv_token{0}, sweep{0}, screen_frame{0}, screen_accept{0}, startup_end{0};
+    uint32_t refreshed{0}, offers{0}, pings{0};
+    bool startup_mode{false};
+    std::vector<uint16_t> differs;
+  } boot_;
   std::vector<uint16_t> bus_b_held_read_keys_;
   uint8_t bus_b_held_sender_{0x12};
   uint32_t bus_b_hold_start_ms_{0};
@@ -351,6 +448,8 @@ class BroanErvProxy : public Component {
   uint32_t tx_ready_b_ms_{0};
 
   uint32_t last_summary_ms_{0};
+  bool dump_active_{false};
+  uint16_t dump_next_key_{0};
   uint32_t last_sensor_pub_ms_{0};
 
   static void drain_uart_(uart::UARTComponent *u, std::vector<uint8_t> &buf, uint32_t &last_ms, uint32_t &byte_counter, uint32_t now) {
@@ -374,6 +473,21 @@ class BroanErvProxy : public Component {
     }
     return out;
   }
+
+  // 32-bit little-endian value as the 4 bytes the ERV uses for integer registers.
+  static std::vector<uint8_t> u32_le_(uint32_t v) {
+    return {uint8_t(v), uint8_t(v >> 8), uint8_t(v >> 16), uint8_t(v >> 24)};
+  }
+  // 32-bit little-endian IEEE float, as used for setpoints and sensor readings.
+  static std::vector<uint8_t> f32_le_(float f) {
+    uint32_t v;
+    std::memcpy(&v, &f, 4);
+    return u32_le_(v);
+  }
+
+  // Registers the ERV changes by itself right after a write: a countdown timer and one-shot
+  // triggers. Holding back older values for them would only produce a false "ERV kept" warning.
+  static bool no_write_guard_(uint16_t key) { return key == 0x0830 || key == 0x0130 || key == 0x1600; }
 
   static uint8_t calc_checksum_(const uint8_t *data, size_t len) {
     uint8_t sum = 0;
@@ -426,20 +540,23 @@ class BroanErvProxy : public Component {
 
   void enqueue_bus_a_write_(uint16_t key, const std::vector<uint8_t> &val) {
     if (key == 0x0050) return;
-
     if (!val.empty()) {
+      // Show the new value right away and ignore older ERV values until it applies the write
+      // (safety expiry 3 s if the write is ever lost).
+      // 0x0020 and 0x0120 both report the mode byte. 0x0220 is NOT predicted: in turbo the ERV keeps
+      // the previous mode there (the mode it returns to). 0x0720 (fan state) isn't predicted either;
+      // both are re-read after the ERV's ack.
+      const uint32_t dl = millis() + 3000;
       auto &rec = this->regs_[key];
       rec.key = key;
-      rec.value = val;
       rec.fetched_from_erv = true;
-      if (key == 0x0020 || key == 0x0220) {
-        this->regs_[0x0020].value = val;
+      if (!no_write_guard_(key)) this->write_guard_[key] = WriteGuard{dl, val};
+      rec.value = val;
+      if (key == 0x0020) {
         this->regs_[0x0120].value = val;
-        this->regs_[0x0220].value = val;
+        this->write_guard_[0x0120] = WriteGuard{dl, val};
       }
-    }
-
-    if (!val.empty()) {
+      // Coalesce: a newer value replaces one still waiting in the queue.
       for (auto &w : this->bus_a_write_queue_) {
         if (w.key == key && !w.value.empty()) {
           w.value = val;
@@ -509,6 +626,7 @@ class BroanErvProxy : public Component {
       }
 
       case 0x04: {
+        if (!this->boot_.erv_token) this->boot_.erv_token = now;
         this->queue_frame_a_(0x10, {0x05}, 3);
         this->bus_a_cycles_++;
         this->bus_a_last_ms_ = now;
@@ -533,6 +651,21 @@ class BroanErvProxy : public Component {
             this->bus_a_state_ = BusAState::HAVE_TOKEN_SEND_READ;
           }
         } else if (this->bus_a_state_ == BusAState::WAIT_WRITE_ACK) {
+          // The ERV accepted these keys. It applies them a little later, so keep the guard until it
+          // reports the new value (max 1.5 s from now) and re-read them on the next READ.
+          for (size_t i = 1; i + 1 < payload.size(); i += 2) {
+            uint16_t k = (uint16_t(payload[i]) << 8) | payload[i + 1];
+            bool still_queued = false;
+            for (const auto &w : this->bus_a_write_queue_) if (w.key == k) still_queued = true;
+            if (still_queued) continue;   // a newer value for this key is still waiting to be sent
+            std::vector<uint16_t> keys{k};
+            if (k == 0x0020) keys = {0x0020, 0x0120, 0x0220, 0x0720};
+            for (uint16_t gk : keys) {
+              auto g = this->write_guard_.find(gk);
+              if (g != this->write_guard_.end()) g->second.deadline = now + 1500;
+              this->refresh_keys_.insert(gk);
+            }
+          }
           if (!this->bus_a_write_queue_.empty()) {
             this->bus_a_state_ = BusAState::HAVE_TOKEN_SEND_WRITE;
           } else {
@@ -551,16 +684,49 @@ class BroanErvProxy : public Component {
           idx += 3;
           if (idx + vlen > payload.size()) break;
 
+          auto g = this->write_guard_.find(k);
+          if (g != this->write_guard_.end()) {
+            bool matches = g->second.expect.size() == vlen &&
+                           std::equal(g->second.expect.begin(), g->second.expect.end(), payload.begin() + idx);
+            if (matches) {
+              this->write_guard_.erase(g);                 // ERV now reports what we wrote
+            } else if ((int32_t) (now - g->second.deadline) < 0) {
+              idx += vlen;                                 // old value, ERV hasn't applied the write yet
+              continue;
+            } else {
+              ESP_LOGW(TAG, "[Bus A] ERV kept 0x%04X = %s instead of the value written; using the ERV's value", k,
+                       format_hex_(payload.data() + idx, std::min<size_t>(vlen, 8)).c_str());
+              this->write_guard_.erase(g);
+            }
+          }
           auto &rec = this->regs_[k];
           rec.key = k;
+          if ((k == 0x0020 || k == 0x0620 || k == 0x0720 || k == 0x0E22 || k == 0x0322 || k == 0x0F22 ||
+               k == 0x1022) && vlen == 1 &&
+              (rec.value.size() != 1 || rec.value[0] != payload[idx])) {
+            ESP_LOGI(TAG, "[ERV state] 0x%04X: %s -> %02X  (supply %.1f CFM)", k,
+                     rec.value.size() == 1 ? format_hex_(rec.value.data(), 1).c_str() : "--",
+                     payload[idx], this->get_f32_reg_(0x0510));
+          }
+          // Only registers outside the poll batches are worth checking: the polled ones carry live values
+          // (temperatures, airflow, mode, timers) that are expected to differ from any snapshot.
+          if (rec.seeded && !rec.fetched_from_erv && !rec.value.empty() && !this->in_poll_batches_(k) &&
+              (rec.value.size() != vlen || !std::equal(rec.value.begin(), rec.value.end(), payload.begin() + idx))) {
+            ESP_LOGI(TAG, "[Bus A] 0x%04X: ERV value differs from the built-in starting value (now using the ERV's)", k);
+            if (this->boot_.differs.size() < 24) this->boot_.differs.push_back(k);
+          }
+          if (k == 0x0020 && vlen == 1) {
+            if (payload[idx] == 0x14) this->boot_.startup_mode = true;
+            else if (this->boot_.startup_mode && !this->boot_.startup_end) this->boot_.startup_end = now;
+          }
           rec.value.assign(payload.begin() + idx, payload.begin() + idx + vlen);
           rec.fetched_from_erv = true;
-          rec.last_erv_update_ms = now;
           this->urgent_poll_keys_.erase(k);
           idx += vlen;
         }
 
         if (this->bus_b_state_ == BusBState::HOLD_FOR_CACHE_MISS && this->urgent_poll_keys_.empty()) {
+          this->note_hold_(now, false);
           this->send_bus_b_read_response_(this->bus_b_held_sender_, this->bus_b_held_read_keys_);
           this->bus_b_state_ = BusBState::CONTROLLER_HAS_TOKEN;
           this->bus_b_last_ms_ = now;
@@ -624,15 +790,25 @@ class BroanErvProxy : public Component {
 
       case BusAState::HAVE_TOKEN_SEND_READ: {
         std::vector<uint8_t> pl = {0x20};
+        // Keys the screen asked for (info pages) are polled for 60 s after its last request, then dropped.
+        if (!this->dynamic_extra_keys_.empty() && (int32_t) (now - this->dynamic_extra_expire_ms_) >= 0)
+          this->dynamic_extra_keys_.clear();
 
-        if (!this->urgent_poll_keys_.empty()) {
+        if (this->urgent_poll_keys_.empty() && !this->refresh_keys_.empty()) {
+          size_t count = 0;
+          for (auto it = this->refresh_keys_.begin(); it != this->refresh_keys_.end() && count < 16; count++) {
+            pl.push_back((*it >> 8) & 0xFF);
+            pl.push_back(*it & 0xFF);
+            it = this->refresh_keys_.erase(it);
+          }
+        } else if (!this->urgent_poll_keys_.empty()) {
           size_t count = 0;
           for (uint16_t k : this->urgent_poll_keys_) {
             pl.push_back((k >> 8) & 0xFF);
             pl.push_back(k & 0xFF);
             if (++count >= 16) break;
           }
-        } else if (!this->dynamic_extra_keys_.empty() && (now < this->dynamic_extra_expire_ms_) &&
+        } else if (!this->dynamic_extra_keys_.empty() &&
                    (this->bus_a_cycles_ % 2 == 1)) {
           size_t count = 0;
           for (uint16_t k : this->dynamic_extra_keys_) {
@@ -649,7 +825,20 @@ class BroanErvProxy : public Component {
           this->current_batch_idx_ = (this->current_batch_idx_ + 1) % this->poll_batches_.size();
           if (this->current_batch_idx_ == 0 && !this->bus_a_initial_sweep_done_) {
             this->bus_a_initial_sweep_done_ = true;
-            ESP_LOGI(TAG, "[Bus A] Initial register sweep from real ERV complete! Enabling Bus B.");
+            // Starting values for registers outside the poll batches (boot-only IDs, installer menu)
+            // are read once from the ERV, so the cache holds this unit's live values from the start.
+            // 0x1600 is the fault-log clear trigger: never touched by the proxy itself.
+            size_t n = 0;
+            for (const auto &kv : this->regs_) {
+              if (!kv.second.fetched_from_erv && kv.first != 0x1600 && kv.first != 0x0450 && kv.first != 0x0550) {
+                this->refresh_keys_.insert(kv.first);
+                n++;
+              }
+            }
+            this->boot_.sweep = now;
+            this->boot_.refreshed = n;
+            ESP_LOGI(TAG, "[Bus A] Initial register sweep from real ERV complete! Enabling Bus B. "
+                          "Reading %u more starting-value registers once.", (unsigned) n);
           }
         }
 
@@ -741,6 +930,8 @@ class BroanErvProxy : public Component {
 
   void handle_frame_from_wall_(uint8_t sender, const std::vector<uint8_t> &payload, uint32_t now) {
     uint8_t msg_type = payload[0];
+    if (!this->boot_.screen_frame) this->boot_.screen_frame = now;
+    if (msg_type == 0x03 && !this->boot_.screen_accept) this->boot_.pings++;
 
     switch (msg_type) {
       case 0x03: {
@@ -754,6 +945,10 @@ class BroanErvProxy : public Component {
 
       case 0x05: {
         if (this->bus_b_state_ == BusBState::WAIT_TOKEN_ACCEPT) {
+          uint32_t lat = now - this->bus_b_offer_ms_;
+          if (lat > this->bus_b_accept_max_ms_) this->bus_b_accept_max_ms_ = lat;
+          if (lat > 50) this->bus_b_accept_late_++;
+          if (!this->boot_.screen_accept) this->boot_.screen_accept = now;
           if (this->bus_b_cycles_ == 0) {
             ESP_LOGI(TAG, ">>> [Bus B] VTTOUCHW (0x%02X) accepted first token offer!", sender);
           }
@@ -773,6 +968,8 @@ class BroanErvProxy : public Component {
       }
 
       case 0x20: {
+        // The screen is using its turn even if we never saw its 0x05 (lost or late): don't re-offer.
+        if (this->bus_b_state_ == BusBState::WAIT_TOKEN_ACCEPT) this->bus_b_state_ = BusBState::CONTROLLER_HAS_TOKEN;
         this->bus_b_last_ms_ = now;
         std::vector<uint16_t> req_keys;
         bool any_missing = false;
@@ -814,6 +1011,7 @@ class BroanErvProxy : public Component {
       }
 
       case 0x40: {
+        if (this->bus_b_state_ == BusBState::WAIT_TOKEN_ACCEPT) this->bus_b_state_ = BusBState::CONTROLLER_HAS_TOKEN;
         this->bus_b_last_ms_ = now;
         std::vector<uint8_t> ack = {0x41};
 
@@ -871,7 +1069,7 @@ class BroanErvProxy : public Component {
       }
 
       case BusBState::WAIT_PING_REPLY: {
-        if (now - this->bus_b_last_ms_ >= 45) {
+        if (now - this->bus_b_last_ms_ >= 100) {
           if (this->bus_b_ping_candidate_ == 0x12) {
             this->bus_b_ping_candidate_ = 0x11;
             this->bus_b_state_ = BusBState::DISCOVERY_PING;
@@ -887,14 +1085,20 @@ class BroanErvProxy : public Component {
       case BusBState::OFFER_TOKEN: {
         if (now - this->bus_b_last_ms_ >= 15) {
           this->queue_frame_b_(this->bus_b_ctrl_addr_, {0x04}, 2);
+          if (!this->boot_.screen_accept) this->boot_.offers++;
           this->bus_b_state_ = BusBState::WAIT_TOKEN_ACCEPT;
           this->bus_b_last_ms_ = now;
+          this->bus_b_offer_ms_ = now;
         }
         break;
       }
 
       case BusBState::WAIT_TOKEN_ACCEPT: {
-        if (now - this->bus_b_last_ms_ >= 50) {
+        // The screen normally accepts within a few ms, but it can be slow (e.g. while redrawing after
+        // a mode change). Re-offering after only 50 ms made our 0x04 collide with its late 0x05.
+        uint32_t last = this->bus_b_last_ms_;
+        if ((int32_t) (this->last_rx_b_ms_ - last) > 0) last = this->last_rx_b_ms_;
+        if (now - last >= 250) {
           this->bus_b_missed_offers_++;
           if (this->bus_b_missed_offers_ >= 3) {
             this->bus_b_missed_offers_ = 0;
@@ -909,7 +1113,10 @@ class BroanErvProxy : public Component {
       }
 
       case BusBState::HOLD_FOR_CACHE_MISS: {
-        if (now - this->bus_b_hold_start_ms_ >= 150) {
+        // The ERV offers us a turn about every 90 ms, so a fetch can take ~150 ms in the worst case.
+        // 250 ms leaves room for that and still answers well inside the screen's ~450 ms timeout.
+        if (now - this->bus_b_hold_start_ms_ >= 250) {
+          this->note_hold_(now, true);
           this->urgent_poll_keys_.clear();
           this->send_bus_b_read_response_(this->bus_b_held_sender_, this->bus_b_held_read_keys_);
           this->bus_b_state_ = BusBState::CONTROLLER_HAS_TOKEN;
@@ -919,7 +1126,13 @@ class BroanErvProxy : public Component {
       }
 
       case BusBState::CONTROLLER_HAS_TOKEN: {
-        if (now - this->bus_b_last_ms_ >= 600) {
+        // Count from the last byte heard, not just the last complete frame, and give the screen
+        // more time: it has been measured holding the token for 800+ ms.
+        uint32_t last = this->bus_b_last_ms_;
+        if ((int32_t) (this->last_rx_b_ms_ - last) > 0) last = this->last_rx_b_ms_;
+        if (now - last >= 1200) {
+          ESP_LOGI(TAG, "[Bus B] VTTOUCHW silent for %u ms while holding the token -> offering it again",
+                   (unsigned) (now - last));
           this->bus_b_state_ = BusBState::OFFER_TOKEN;
           this->bus_b_last_ms_ = now;
         }
@@ -936,12 +1149,19 @@ class BroanErvProxy : public Component {
     });
     this->poll_batches_.push_back({
       0x0030, 0x0230, 0x0330, 0x0430, 0x0421, 0x0521,
-      0x0621, 0x0C21, 0x0D21, 0x0850, 0x0950, 0x1250,
-      0x1350, 0x1450, 0x1950, 0x2050, 0x2150
+      0x0621, 0x0C21, 0x0D21, 0x0850, 0x0950, 
+      0x1250, 0x1350, 0x1450, 0x1950, 0x2050, 0x2150
     });
     this->poll_batches_.push_back({
       0x1200, 0x1400, 0x1A00, 0x0AF0, 0x0510, 0x0610, 0x0100
     });
+  }
+
+  bool in_poll_batches_(uint16_t key) const {
+    for (const auto &b : this->poll_batches_)
+      for (uint16_t k : b)
+        if (k == key) return true;
+    return false;
   }
 
   bool is_in_core_batches_(uint16_t key) const {
@@ -968,6 +1188,7 @@ class BroanErvProxy : public Component {
     RegisterRecord rec;
     rec.key = key;
     rec.value.assign(bytes.begin(), bytes.end());
+    rec.seeded = true;
     this->regs_[key] = std::move(rec);
   }
 
@@ -976,7 +1197,7 @@ class BroanErvProxy : public Component {
     seed_reg_(0x0022, {0x00, 0x00, 0x00, 0x00});
     seed_reg_(0x0030, {0x00});
     seed_reg_(0x0100, {0x01, 0xCC, 0x28});
-    seed_reg_(0x0120, {0x08});
+    seed_reg_(0x0120, {0x08});   // mirrors the 0x0020 seed
     seed_reg_(0x01E0, {0x95, 0x3A, 0x85, 0x41});
     seed_reg_(0x0220, {0x08});
     seed_reg_(0x0222, {0x60, 0x09, 0x00, 0x00});
@@ -1060,6 +1281,11 @@ class BroanErvProxy : public Component {
     return fallback;
   }
 
+  uint8_t get_u8_reg_(uint16_t key, uint8_t fallback = 0) const {
+    auto it = this->regs_.find(key);
+    return (it != this->regs_.end() && !it->second.value.empty()) ? it->second.value[0] : fallback;
+  }
+
   uint32_t get_u32_reg_(uint16_t key, uint32_t fallback = 0) const {
     auto it = this->regs_.find(key);
     if (it != this->regs_.end() && it->second.value.size() == 4) {
@@ -1091,29 +1317,74 @@ class BroanErvProxy : public Component {
     }
   }
 
-  void print_summary_(uint32_t /*now*/, bool full_dump) {
-    ESP_LOGI(TAG, "PROXY | BusA(ERV) Cyc:%u RxB:%u Err:%u | BusB(Wall) Cyc:%u RxB:%u Echo:%u Err:%u | Mode:0x%02X",
+  void note_hold_(uint32_t now, bool timed_out) {
+    uint32_t ms = now - this->bus_b_hold_start_ms_;
+    this->bus_b_holds_++;
+    if (ms > this->bus_b_hold_max_ms_) this->bus_b_hold_max_ms_ = ms;
+    if (timed_out) {
+      this->bus_b_hold_timeouts_++;
+      ESP_LOGW(TAG, "[Bus B] ERV did not answer a cache-miss fetch within %u ms; replying with cached/placeholder bytes",
+               (unsigned) ms);
+    }
+  }
+
+  void print_boot_report_() {
+    const auto &b = this->boot_;
+    auto rel = [&](uint32_t t) -> std::string {
+      if (!t) return "not yet";
+      char buf[16];
+      snprintf(buf, sizeof(buf), "+%u ms", (unsigned) (t - b.t0));
+      return buf;
+    };
+    ESP_LOGI(TAG, "BOOT | ERV first turn %s | first full read %s, %u extra registers read once, %u static values differed | "
+                  "screen first frame %s, first token accepted %s after %u offers / %u ping replies",
+             rel(b.erv_token).c_str(), rel(b.sweep).c_str(), (unsigned) b.refreshed, (unsigned) b.differs.size(),
+             rel(b.screen_frame).c_str(), rel(b.screen_accept).c_str(), (unsigned) b.offers, (unsigned) b.pings);
+    if (b.startup_mode) {
+      ESP_LOGI(TAG, "BOOT | ERV reported start-up mode 0x14 until %s", rel(b.startup_end).c_str());
+    }
+    if (!b.differs.empty()) {
+      std::string list;
+      for (uint16_t k : b.differs) { char buf[8]; snprintf(buf, sizeof(buf), " %04X", k); list += buf; }
+      ESP_LOGI(TAG, "BOOT | starting values that differed from this ERV:%s", list.c_str());
+    }
+  }
+
+  void print_summary_() {
+    ESP_LOGI(TAG, "PROXY | BusA(ERV) Cyc:%u RxB:%u Err:%u | BusB(Wall) Cyc:%u RxB:%u Echo:%u Err:%u Miss:%u | Mode:0x%02X",
              (unsigned) this->bus_a_cycles_, (unsigned) this->bus_a_rx_bytes_, (unsigned) this->bus_a_chk_err_,
              (unsigned) this->bus_b_cycles_, (unsigned) this->bus_b_rx_bytes_, (unsigned) this->bus_b_echoes_,
-             (unsigned) this->bus_b_chk_err_, this->get_current_mode_byte());
-
-    if (!full_dump) return;
-
-    ESP_LOGI(TAG, "================ STAGE 2 PROXY REGISTER DUMP ================");
-    for (const auto &kv : this->regs_) {
-      const auto &r = kv.second;
-      char hex[64] = {0};
-      size_t max_b = std::min<size_t>(r.value.size(), 12);
-      size_t pos = 0;
-      for (size_t i = 0; i < max_b; i++) {
-        pos += snprintf(hex + pos, sizeof(hex) - pos, "%s%02X", (i == 0 ? "" : " "), r.value[i]);
-      }
-      ESP_LOGI(TAG, "  Reg 0x%04X | ERV:%s | Wall R:%4u W:%2u | Len:%3u | [%s%s]",
-               r.key, r.fetched_from_erv ? "YES" : "SEED",
-               (unsigned) r.read_count_wall, (unsigned) r.write_count_wall,
-               (unsigned) r.value.size(), hex, (r.value.size() > 12 ? " ..." : ""));
+             (unsigned) this->bus_b_chk_err_, (unsigned) this->bus_b_cache_misses_, this->get_current_mode_byte());
+    if (millis() - this->boot_.t0 < 180000) this->print_boot_report_();
+    ESP_LOGI(TAG, "       BusB token accept: slowest %u ms, %u slower than 50 ms (last 15 s)",
+             (unsigned) this->bus_b_accept_max_ms_, (unsigned) this->bus_b_accept_late_);
+    if (this->bus_b_holds_ > 0) {
+      ESP_LOGI(TAG, "       BusB cache-miss holds: %u, longest %u ms, %u timed out (last 15 s)",
+               (unsigned) this->bus_b_holds_, (unsigned) this->bus_b_hold_max_ms_, (unsigned) this->bus_b_hold_timeouts_);
     }
-    ESP_LOGI(TAG, "=============================================================");
+    this->bus_b_accept_max_ms_ = 0;
+    this->bus_b_accept_late_ = 0;
+    this->bus_b_holds_ = 0;
+    this->bus_b_hold_max_ms_ = 0;
+    this->bus_b_hold_timeouts_ = 0;
+  }
+
+  void dump_some_registers_() {
+    auto it = this->regs_.lower_bound(this->dump_next_key_);
+    for (int n = 0; n < 4 && it != this->regs_.end(); n++, ++it) {
+      const auto &r = it->second;
+      ESP_LOGI(TAG, "  Reg 0x%04X | ERV:%s | Wall R:%4u W:%2u | Len:%3u | [%s%s]",
+               it->first, r.fetched_from_erv ? "YES " : "SEED",
+               (unsigned) r.read_count_wall, (unsigned) r.write_count_wall, (unsigned) r.value.size(),
+               format_hex_(r.value.data(), std::min<size_t>(r.value.size(), 12)).c_str(),
+               r.value.size() > 12 ? " ..." : "");
+    }
+    if (it == this->regs_.end()) {
+      ESP_LOGI(TAG, "===============================================================");
+      this->dump_active_ = false;
+    } else {
+      this->dump_next_key_ = it->first;
+    }
   }
 };
 
