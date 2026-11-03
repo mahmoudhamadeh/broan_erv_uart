@@ -9,6 +9,10 @@ esp32:
 
 logger:
   level: INFO
+  logs:
+    sensor: WARN
+    number: WARN
+    select: WARN
   hardware_uart: USB_SERIAL_JTAG
 
 wifi:
@@ -19,9 +23,6 @@ ota:
   - platform: esphome
 
 api:
-
-web_server:
-  port: 80
 
 external_components:
   - source:
@@ -50,6 +51,7 @@ broan_erv_proxy:
   supply_cfm:
     name: "ERV Supply Airflow"
     icon: "mdi:fan-chevron-up"
+    
   exhaust_cfm:
     name: "ERV Exhaust Airflow"
     icon: "mdi:fan-chevron-down"
@@ -57,10 +59,14 @@ broan_erv_proxy:
   erv_temperature:
     name: "ERV Intake Temperature"
     icon: "mdi:thermometer-chevron-down"
+    filters:
+      - offset: -3.1
 
   wall_temperature:
     name: "Room Temperature"
     icon: "mdi:home-thermometer-outline"
+    filters:
+      - offset: -2.1
   wall_humidity:
     name: "Room Humidity"
     icon: "mdi:water-percent"
@@ -84,7 +90,9 @@ select:
       - "SMART / Auto"
       - "Away"
     lambda: |-
-      uint8_t m = id(erv_proxy).get_current_mode_byte();
+      // Only the modes you can choose on the screen. Automatic states (starting up, dehumidifying,
+      // humidistat hold) are shown by "ERV Status"; here the selected mode stays visible.
+      uint8_t m = id(erv_proxy).get_selected_mode_byte();
       switch (m) {
         case 0x01: return std::string("Standby (OFF)");
         case 0x08: return std::string("Intermittent (Timer)");
@@ -94,10 +102,11 @@ select:
         case 0x0C: return std::string("Turbo / Override");
         case 0x0F: return std::string("Away");
         case 0x11: return std::string("SMART / Auto");
-        default:   return std::string("Intermittent (Timer)");
+        default:  return {};   // not known yet: keep the last shown option
       }
-    update_interval: 2s
+    update_interval: 5s
     set_action:
+      - delay: 400ms
       - lambda: |-
           if (x == "Standby (OFF)") {
             id(erv_proxy).write_mode_from_ha(0x01);
@@ -117,12 +126,34 @@ select:
             id(erv_proxy).write_mode_from_ha(0x11);
           }
 
+  # The screen's Humidity Control page: DEHUM. (0x0F22) or HUMIDISTAT (0x1022), or neither.
+  - platform: template
+    name: "ERV Humidity Control"
+    id: erv_humidity_control
+    icon: "mdi:water-percent-alert"
+    options:
+      - "Off"
+      - "Dehumidify"
+      - "Humidistat"
+    lambda: |-
+      switch (id(erv_proxy).get_humidity_mode()) {
+        case 1:  return std::string("Dehumidify");
+        case 2:  return std::string("Humidistat");
+        default: return std::string("Off");
+      }
+    update_interval: 5s
+    set_action:
+      - lambda: |-
+          if (x == "Dehumidify")      id(erv_proxy).write_humidity_mode_from_ha(1);
+          else if (x == "Humidistat") id(erv_proxy).write_humidity_mode_from_ha(2);
+          else                        id(erv_proxy).write_humidity_mode_from_ha(0);
+
 number:
   - platform: template
     name: "ERV Intermittent Mins Per Hour"
     min_value: 10
     max_value: 55
-    step: 5
+    step: 1                      # the screen also uses values like 24 and 36 min/hr
     unit_of_measurement: "min/hr"
     lambda: |-
       return (float)(id(erv_proxy).get_intermittent_seconds() / 60);
@@ -138,11 +169,11 @@ number:
     step: 1
     unit_of_measurement: "%"
     lambda: |-
-      return (float) id(erv_proxy).get_humidity_setpoint();
+      return id(erv_proxy).get_humidity_setpoint();    // 0x0A22, float %RH
     update_interval: 10s
     set_action:
       - lambda: |-
-          id(erv_proxy).write_humidity_setpoint_from_ha((uint32_t) x);
+          id(erv_proxy).write_humidity_setpoint_from_ha(x);
 
   - platform: template
     name: "ERV Turbo Override Duration"
@@ -168,11 +199,30 @@ number:
     mode: slider
     lambda: |-
       return (float) id(erv_proxy).get_fan_speed_level();
-    update_interval: 2s
+    update_interval: 5s
     set_action:
-      - lambda: |-
-          id(erv_proxy).write_fan_speed_from_ha((uint8_t) x);
-          
+      - delay: 400ms
+      - if:
+          condition:
+            lambda: 'return id(erv_proxy).fan_speed_adjustable();'
+          then:
+            # Intermittent / Continuous: apply and show the new speed right away.
+            - lambda: |-
+                id(erv_proxy).write_fan_speed_from_ha((uint8_t) x);
+                id(erv_fan_speed_slider).publish_state((float) id(erv_proxy).get_fan_speed_level());
+          else:
+            # SMART / Away / Turbo / OFF: the ERV picks the speed, so ignore the change and snap back.
+            # HA only redraws the slider when the state actually changes, and here it never left the
+            # real speed (e.g. 3 in Turbo). So briefly report "unknown", then the real speed again.
+            # The 300 ms gap keeps the two updates from being merged before they reach HA.
+            - logger.log:
+                level: WARN
+                format: "Fan speed is set by the ERV in this mode; ignoring %.0f"
+                args: ['x']
+            - lambda: 'id(erv_fan_speed_slider).publish_state(NAN);'
+            - delay: 300ms
+            - lambda: 'id(erv_fan_speed_slider).publish_state((float) id(erv_proxy).get_fan_speed_level());'
+
 button:
   - platform: template
     name: "Reset ERV Filter Timer"
@@ -189,3 +239,50 @@ button:
     on_press:
       - lambda: |-
           id(erv_proxy).dump_status();
+
+binary_sensor:
+  # ON when the Fan Speed slider has an effect (Intermittent or Continuous LOW/MED/HIGH).
+  # Use it in the HA dashboard to show/hide the slider, or in automations.
+  - platform: template
+    name: "ERV Fan Speed Adjustable"
+    id: erv_fan_speed_adjustable
+    icon: "mdi:fan-alert"
+    lambda: |-
+      return id(erv_proxy).fan_speed_adjustable();
+
+text_sensor:
+  # What the ERV is doing right now: following the selected mode, or an automatic state.
+  - platform: template
+    name: "ERV Status"
+    id: erv_status
+    icon: "mdi:information-outline"
+    update_interval: 5s
+    lambda: |-
+      uint8_t m = id(erv_proxy).get_current_mode_byte();
+      switch (m) {
+        case 0x01: return std::string("Off");
+        case 0x14: return std::string("Starting Up");      // ~30 s after the ERV powers on
+        case 0x0D: return std::string("Dehumidifying");    // Dehumidify on, RH above setpoint: fan forced to HIGH
+        case 0x0E: return std::string("Humidistat Hold");  // Humidistat on, RH above setpoint: fans stopped
+        default:
+          if (esphome::broan_erv_proxy::BroanErvProxy::is_selectable_mode(m)) return std::string("Normal");
+          char buf[20];
+          snprintf(buf, sizeof(buf), "Unknown (0x%02X)", m);
+          return std::string(buf);
+      }
+
+  # What the ERV is actually running right now, in every mode (from register 0x0720).
+  - platform: template
+    name: "ERV Running Speed"
+    id: erv_running_speed
+    icon: "mdi:fan"
+    update_interval: 5s
+    lambda: |-
+      switch (id(erv_proxy).get_fan_state()) {
+        case 0x01: return std::string("Low");
+        case 0x04: return std::string("Medium");
+        case 0x02: return std::string("High");
+        case 0x03: return std::string("Turbo");
+        case 0x00: return std::string("Stopped");
+        default:   return std::string("Unknown");
+      }
