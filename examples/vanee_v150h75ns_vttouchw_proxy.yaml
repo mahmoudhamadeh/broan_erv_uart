@@ -1,6 +1,38 @@
 esphome:
   name: vttouchw-stage1
   friendly_name: "VanEE V150H75NS ERV Proxy"
+  on_boot:
+    priority: -100
+    then:
+      # Relays stay off (screen wired straight to the ERV) until the proxy is fully up.
+      - delay: 5s
+      - globals.set:
+          id: boot_done
+          value: 'true'
+      - if:
+          condition:
+            switch.is_off: proxy_bypass
+          then:
+            - script.execute: link_up
+            - delay: 10s
+            - script.execute:
+                id: nest_apply
+                edge: true
+          else:
+            - logger.log: "Proxy bypass is ON: relays stay off, screen talks to the ERV directly"
+  on_shutdown:
+    then:
+      - script.execute: link_down
+
+globals:
+  - id: nest_ctl
+    type: esphome::broan_erv_proxy::NestVentController
+    restore_value: false
+
+  - id: boot_done
+    type: bool
+    restore_value: false
+    initial_value: 'false'
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -21,6 +53,15 @@ wifi:
 
 ota:
   - platform: esphome
+    on_begin:
+      # The loop stalls during OTA; hand the screen straight to the ERV so nothing errors out.
+      - script.execute: link_down
+    on_error:
+      - if:
+          condition:
+            switch.is_off: proxy_bypass
+          then:
+            - script.execute: link_up
 
 api:
 
@@ -48,32 +89,46 @@ broan_erv_proxy:
   id: erv_proxy
   uart_erv: bus_a_erv
   uart_wall: bus_b_wall
+  # The component reads these every 10 s; "delta" only passes a value that actually moved.
   supply_cfm:
     name: "ERV Supply Airflow"
+    id: erv_supply_cfm
     icon: "mdi:fan-chevron-up"
-    
+    filters:
+      - delta: 0.05
+
   exhaust_cfm:
     name: "ERV Exhaust Airflow"
+    id: erv_exhaust_cfm
     icon: "mdi:fan-chevron-down"
+    filters:
+      - delta: 0.05
 
   erv_temperature:
     name: "ERV Intake Temperature"
+    id: erv_intake_temp
     icon: "mdi:thermometer-chevron-down"
     filters:
       - offset: -3.1
+      - delta: 0.05
 
   wall_temperature:
     name: "Room Temperature"
     icon: "mdi:home-thermometer-outline"
     filters:
       - offset: -2.1
+      - delta: 0.05
   wall_humidity:
     name: "Room Humidity"
     icon: "mdi:water-percent"
+    filters:
+      - delta: 0.05
 
   filter_remaining_days:
     name: "ERV Filter Remaining"
     icon: "mdi:air-filter"
+    filters:
+      - delta: 0.05
 
 select:
   - platform: template
@@ -92,19 +147,21 @@ select:
     lambda: |-
       // Only the modes you can choose on the screen. Automatic states (starting up, dehumidifying,
       // humidistat hold) are shown by "ERV Status"; here the selected mode stays visible.
-      uint8_t m = id(erv_proxy).get_selected_mode_byte();
-      switch (m) {
-        case 0x01: return std::string("Standby (OFF)");
-        case 0x08: return std::string("Intermittent (Timer)");
-        case 0x09: return std::string("Continuous (LOW)");
-        case 0x0B: return std::string("Continuous (MED)");
-        case 0x0A: return std::string("Continuous (HIGH)");
-        case 0x0C: return std::string("Turbo / Override");
-        case 0x0F: return std::string("Away");
-        case 0x11: return std::string("SMART / Auto");
-        default:  return {};   // not known yet: keep the last shown option
+      const char *opt;
+      switch (id(erv_proxy).get_selected_mode_byte()) {
+        case 0x01: opt = "Standby (OFF)"; break;
+        case 0x08: opt = "Intermittent (Timer)"; break;
+        case 0x09: opt = "Continuous (LOW)"; break;
+        case 0x0B: opt = "Continuous (MED)"; break;
+        case 0x0A: opt = "Continuous (HIGH)"; break;
+        case 0x0C: opt = "Turbo / Override"; break;
+        case 0x0F: opt = "Away"; break;
+        case 0x11: opt = "SMART / Auto"; break;
+        default:   return {};   // not known yet: keep the last shown option
       }
-    update_interval: 5s
+      if (id(erv_mode_select).current_option() == opt) return {};   // unchanged: don't republish
+      return std::string(opt);
+    update_interval: 1s
     set_action:
       - delay: 400ms
       - lambda: |-
@@ -136,11 +193,14 @@ select:
       - "Dehumidify"
       - "Humidistat"
     lambda: |-
+      const char *opt;
       switch (id(erv_proxy).get_humidity_mode()) {
-        case 1:  return std::string("Dehumidify");
-        case 2:  return std::string("Humidistat");
-        default: return std::string("Off");
+        case 1:  opt = "Dehumidify"; break;
+        case 2:  opt = "Humidistat"; break;
+        default: opt = "Off"; break;
       }
+      if (id(erv_humidity_control).current_option() == opt) return {};
+      return std::string(opt);
     update_interval: 5s
     set_action:
       - lambda: |-
@@ -148,15 +208,38 @@ select:
           else if (x == "Humidistat") id(erv_proxy).write_humidity_mode_from_ha(2);
           else                        id(erv_proxy).write_humidity_mode_from_ha(0);
 
+  # What the Nest's ventilation call does. "Just a sensor in HA" only reports it.
+  # "Nest in charge": while the Nest calls, Continuous at a speed set by the outdoor temperature
+  # (>= 5 C HIGH, 5..-10 C MED, below -10 C LOW); Standby when it stops. Defrost is never cut short.
+  # (Logic: NestVentController in broan_erv_proxy.h.)
+  - platform: template
+    name: "Nest Ventilation Behavior"
+    id: nest_behavior
+    icon: "mdi:thermostat-auto"
+    entity_category: "config"
+    options:
+      - "Just a sensor in HA"
+      - "Nest in charge"
+    initial_option: "Just a sensor in HA"
+    optimistic: true
+    restore_value: true
+    on_value:
+      - script.execute:
+          id: nest_apply
+          edge: true
+
 number:
   - platform: template
     name: "ERV Intermittent Mins Per Hour"
+    id: erv_int_minutes
     min_value: 10
     max_value: 55
     step: 1                      # the screen also uses values like 24 and 36 min/hr
     unit_of_measurement: "min/hr"
     lambda: |-
-      return (float)(id(erv_proxy).get_intermittent_seconds() / 60);
+      const float v = (float) (id(erv_proxy).get_intermittent_seconds() / 60);
+      if (id(erv_int_minutes).has_state() && id(erv_int_minutes).state == v) return {};
+      return v;
     update_interval: 10s
     set_action:
       - lambda: |-
@@ -164,12 +247,16 @@ number:
 
   - platform: template
     name: "ERV Humidity Setpoint"
+    id: erv_hum_setpoint
     min_value: 20
     max_value: 60
     step: 1
     unit_of_measurement: "%"
     lambda: |-
-      return id(erv_proxy).get_humidity_setpoint();    // 0x0A22, float %RH
+      const float v = id(erv_proxy).get_humidity_setpoint();    // 0x0A22, float %RH
+      const float cur = id(erv_hum_setpoint).state;
+      if (id(erv_hum_setpoint).has_state() && (cur == v || (std::isnan(cur) && std::isnan(v)))) return {};
+      return v;
     update_interval: 10s
     set_action:
       - lambda: |-
@@ -177,13 +264,16 @@ number:
 
   - platform: template
     name: "ERV Turbo Override Duration"
+    id: erv_turbo_hours
     icon: "mdi:timer-outline"
     min_value: 1
     max_value: 4
     step: 1
     unit_of_measurement: "h"
     lambda: |-
-      return (float) id(erv_proxy).get_turbo_timeout_hours();
+      const float v = (float) id(erv_proxy).get_turbo_timeout_hours();
+      if (id(erv_turbo_hours).has_state() && id(erv_turbo_hours).state == v) return {};
+      return v;
     update_interval: 10s
     set_action:
       - lambda: |-
@@ -198,8 +288,11 @@ number:
     step: 1
     mode: slider
     lambda: |-
-      return (float) id(erv_proxy).get_fan_speed_level();
-    update_interval: 5s
+      // After the snap-back trick the state is NAN, which never equals v, so the real value goes out.
+      const float v = (float) id(erv_proxy).get_fan_speed_level();
+      if (id(erv_fan_speed_slider).has_state() && id(erv_fan_speed_slider).state == v) return {};
+      return v;
+    update_interval: 1s
     set_action:
       - delay: 400ms
       - if:
@@ -235,12 +328,32 @@ button:
   - platform: template
     name: "Dump Proxy Register Cache"
     icon: "mdi:database-export"
-    entity_category: "diagnostic"
+    entity_category: "config"
     on_press:
       - lambda: |-
           id(erv_proxy).dump_status();
 
 binary_sensor:
+  # Nest AQ+ (1-wire ventilation, 24 VAC) drives an Omron G7L at the furnace; its contact is
+  # wired between G38 and G39. G39 is held LOW as the contact's own ground (Bus B GND untouched).
+  - platform: gpio
+    name: "Nest Wants Ventilation"
+    id: nest_vent_call
+    icon: "mdi:thermostat"
+    pin:
+      number: GPIO38
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    filters:
+      - delayed_on: 2s
+      - delayed_off: 2s
+    on_state:
+      - script.execute:
+          id: nest_apply
+          edge: true
+
   # ON when the Fan Speed slider has an effect (Intermittent or Continuous LOW/MED/HIGH).
   # Use it in the HA dashboard to show/hide the slider, or in automations.
   - platform: template
@@ -250,6 +363,32 @@ binary_sensor:
     lambda: |-
       return id(erv_proxy).fan_speed_adjustable();
 
+  # Defrost, from the airflow pattern (VanEE V150H: exhaust defrost at -5 C and colder, supply fan
+  # off and exhaust on for 9-10 min). Starts only when it is cold; once on it stays on while the
+  # pattern lasts (the intake reading warms up when the supply fan stops). The 60 s hold ignores
+  # fan start-up transients. Replace with the ERV's own flag once the change watcher finds it.
+  - platform: template
+    name: "ERV Defrost"
+    id: erv_defrost
+    icon: "mdi:snowflake-melt"
+    lambda: |-
+      static bool latched = false;
+      const float t = id(erv_intake_temp).state;
+      const float sup = id(erv_supply_cfm).state;
+      const float exh = id(erv_exhaust_cfm).state;
+      const bool pattern = id(erv_proxy).is_link_active() && !std::isnan(sup) && !std::isnan(exh) &&
+                           sup < 10.0f && exh > 20.0f;
+      if (!pattern) latched = false;
+      else if (!std::isnan(t) && t <= -3.0f) latched = true;
+      return latched;
+    filters:
+      - delayed_on: 60s
+      - delayed_off: 30s
+    on_release:
+      - script.execute:
+          id: nest_apply
+          edge: false
+
 text_sensor:
   # What the ERV is doing right now: following the selected mode, or an automatic state.
   - platform: template
@@ -258,18 +397,22 @@ text_sensor:
     icon: "mdi:information-outline"
     update_interval: 5s
     lambda: |-
-      uint8_t m = id(erv_proxy).get_current_mode_byte();
-      switch (m) {
-        case 0x01: return std::string("Off");
-        case 0x14: return std::string("Starting Up");      // ~30 s after the ERV powers on
-        case 0x0D: return std::string("Dehumidifying");    // Dehumidify on, RH above setpoint: fan forced to HIGH
-        case 0x0E: return std::string("Humidistat Hold");  // Humidistat on, RH above setpoint: fans stopped
-        default:
-          if (esphome::broan_erv_proxy::BroanErvProxy::is_selectable_mode(m)) return std::string("Normal");
-          char buf[20];
-          snprintf(buf, sizeof(buf), "Unknown (0x%02X)", m);
-          return std::string(buf);
+      std::string v;
+      const uint8_t m = id(erv_proxy).get_current_mode_byte();
+      if (id(proxy_bypass).state) v = "Bypassed (screen only)";
+      else if (id(erv_defrost).state) v = "Defrosting";            // supply fan off, exhaust on (cold)
+      else if (m == 0x01) v = "Off";
+      else if (m == 0x14) v = "Starting Up";       // ~30 s after the ERV powers on
+      else if (m == 0x0D) v = "Dehumidifying";     // Dehumidify on, RH above setpoint: fan forced to HIGH
+      else if (m == 0x0E) v = "Humidistat Hold";   // Humidistat on, RH above setpoint: fans stopped
+      else if (esphome::broan_erv_proxy::BroanErvProxy::is_selectable_mode(m)) v = "Normal";
+      else {
+        char buf[20];
+        snprintf(buf, sizeof(buf), "Unknown (0x%02X)", m);
+        v = buf;
       }
+      if (id(erv_status).has_state() && id(erv_status).state == v) return {};
+      return v;
 
   # What the ERV is actually running right now, in every mode (from register 0x0720).
   - platform: template
@@ -278,11 +421,106 @@ text_sensor:
     icon: "mdi:fan"
     update_interval: 5s
     lambda: |-
+      std::string v;
       switch (id(erv_proxy).get_fan_state()) {
-        case 0x01: return std::string("Low");
-        case 0x04: return std::string("Medium");
-        case 0x02: return std::string("High");
-        case 0x03: return std::string("Turbo");
-        case 0x00: return std::string("Stopped");
-        default:   return std::string("Unknown");
+        case 0x01: v = "Low"; break;
+        case 0x04: v = "Medium"; break;
+        case 0x02: v = "High"; break;
+        case 0x03: v = "Turbo"; break;
+        case 0x00: v = "Stopped"; break;
+        default:   v = "Unknown"; break;
       }
+      if (id(erv_running_speed).has_state() && id(erv_running_speed).state == v) return {};
+      return v;
+
+output:
+  # D-229 IN-1..IN-4 (jumpered). HIGH = relays on = proxy in the path.
+  # LOW / no power / no firmware = NC contacts = screen wired straight to the ERV.
+  - platform: gpio
+    id: proxy_relays
+    pin: GPIO7
+
+switch:
+  # ON = take the ESP out of the path (diagnostics). Kept across reboots.
+  - platform: template
+    name: "Proxy Bypass (Screen Only)"
+    id: proxy_bypass
+    icon: "mdi:call-split"
+    entity_category: "config"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - script.execute: link_down
+    turn_off_action:
+      # During boot the on_boot sequence switches the relays on, not this.
+      - if:
+          condition:
+            lambda: 'return id(boot_done);'
+          then:
+            - script.execute: link_up
+            - delay: 10s
+            - script.execute:
+                id: nest_apply
+                edge: true
+
+  # Local ground for the Nest relay contact (held LOW, not shown in HA).
+  - platform: gpio
+    id: nest_sense_ref
+    pin: GPIO39
+    restore_mode: ALWAYS_OFF
+    internal: true
+
+script:
+  # Every relay switch goes through these two, so the proxy always knows whether it is on the buses.
+  # link_down: stop transmitting and wait (max 150 ms) for a gap between frames on both buses, then
+  #            drop the relays. Runs to completion synchronously, so it also works inside OTA on_begin.
+  - id: link_down
+    mode: single
+    then:
+      - lambda: 'id(erv_proxy).quiesce_for_disconnect(150);'
+      - output.turn_off: proxy_relays
+      - lambda: 'id(erv_proxy).set_link_active(false);'
+
+  # link_up: relays on, then restart both buses. The screen is only served once Bus A has re-read
+  # the ERV, so it never sees values cached before a bypass.
+  - id: link_up
+    mode: single
+    then:
+      - output.turn_on: proxy_relays
+      - lambda: 'id(erv_proxy).set_link_active(true);'
+
+  # "Nest in charge" (rules in NestVentController, broan_erv_proxy.h).
+  # edge = true: a Nest call change, "Nest in charge" just selected, or the proxy back in the path
+  # after boot / bypass -> act now. edge = false: the 10 s tick -> speed follow-up only.
+  # Does nothing while bypassed or while "Just a sensor in HA" is selected.
+  - id: nest_apply
+    mode: queued
+    max_runs: 3
+    parameters:
+      edge: bool
+    then:
+      - lambda: |-
+          if (!id(boot_done) || id(proxy_bypass).state) return;
+          auto idx = id(nest_behavior).active_index();
+          if (!idx.has_value() || *idx != 1) return;              // 1 = "Nest in charge"
+          const uint8_t target = id(nest_ctl).decide(millis(), id(nest_vent_call).state, edge,
+                                                     id(erv_proxy).get_selected_mode_byte(), id(erv_defrost).state);
+          if (target != 0) id(erv_proxy).write_mode_from_ha(target);
+
+interval:
+  # Every 10 s: update the outdoor-temperature estimate, then let "Nest in charge" adjust speed or
+  # run a change that was waiting for a defrost to end.
+  - interval: 10s
+    then:
+      - lambda: |-
+          // While bypassed the sensors are frozen at their last values: feed nothing (NAN), so the
+          // 2-minute airflow timer restarts once the proxy is back on the buses.
+          if (!id(erv_proxy).is_link_active()) {
+            id(nest_ctl).observe(millis(), NAN, NAN, NAN);
+          } else {
+            id(nest_ctl).observe(millis(), id(erv_intake_temp).state, id(erv_supply_cfm).state,
+                                 id(erv_exhaust_cfm).state);
+          }
+      - script.execute:
+          id: nest_apply
+          edge: false
