@@ -1,0 +1,213 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# ERV → Google Home as ONE device: fan.erv
+#
+# Google Home has no Matter "Mode Select", so the ESPHome select/number entities
+# never show up there. This package wraps them in a single fan entity:
+#
+#   fan.erv   on/off · speed 1-3 (Low/Med/High) · presets auto (SMART),
+#             intermittent, away, turbo
+#   sensor.erv_filter_life (%) - fed into the fan's card on the Matter path
+#
+# Two ways to put fan.erv into Google Home (pick ONE, never both):
+#   A) Matter Hub (local):  map fan.erv as "Air Purifier", Filter Life Sensor =
+#      sensor.erv_filter_life. Google shows on/off, Low/Med/High, Auto, filter.
+#      Intermittent / Away / Turbo don't exist in Matter, so Google can't reach them.
+#   B) HA Google Assistant integration (cloud, same way Vents does it): Google
+#      shows on/off, speed 1-3 AND every preset as a mode. No filter status.
+#
+# Install: put this file in /config/packages/ and make sure configuration.yaml has
+#   homeassistant:
+#     packages: !include_dir_named packages
+#
+# Entity IDs below assume the ESPHome device keeps its friendly name
+# "VanEE V150H75NS ERV Proxy" (prefix vanee_v150h75ns_erv_proxy_). If yours differ,
+# find/replace that prefix.
+# ─────────────────────────────────────────────────────────────────────────────
+
+template:
+  # Last "normal" mode (Intermittent, Continuous or SMART). Used to restore the mode on
+  # power-on. Survives HA restarts.
+  - triggers:
+      - trigger: state
+        entity_id: select.vanee_v150h75ns_erv_proxy_erv_operating_mode
+        to:
+          - "Intermittent (Timer)"
+          - "Continuous (LOW)"
+          - "Continuous (MED)"
+          - "Continuous (HIGH)"
+          - "SMART / Auto"
+    sensor:
+      - name: "ERV Last Mode"
+        unique_id: erv_last_mode
+        icon: mdi:history
+        state: "{{ trigger.to_state.state }}"
+
+  - sensor:
+      # Filter life in % for the Matter filter indicator (Google Home shows filter status).
+      # The ERV's filter interval is 90 days (0x0930 = 7 776 000 s). Change 90 if you change it.
+      - name: "ERV Filter Life"
+        unique_id: erv_filter_life
+        icon: mdi:air-filter
+        unit_of_measurement: "%"
+        state_class: measurement
+        availability: "{{ has_value('sensor.vanee_v150h75ns_erv_proxy_erv_filter_remaining') }}"
+        state: >-
+          {% set days = states('sensor.vanee_v150h75ns_erv_proxy_erv_filter_remaining') | float(0) %}
+          {{ [0, [100, (days / 90 * 100) | round(0)] | min] | max | int }}
+
+  - fan:
+      - name: "ERV"
+        unique_id: erv_fan
+        icon: mdi:hvac
+        availability: >-
+          {{ states('select.vanee_v150h75ns_erv_proxy_erv_operating_mode') not in ['unknown', 'unavailable'] }}
+        state: >-
+          {{ 'off' if is_state('select.vanee_v150h75ns_erv_proxy_erv_operating_mode', 'Standby (OFF)') else 'on' }}
+        # 1 % steps, so Matter Hub passes the raw slider value through and the zones in
+        # script.erv_fan_command decide the speed (0-1 off, 2-33 low, 34-67 medium, 68-100 high).
+        # The fan still reports 33 / 66 / 100, which Matter shows as Low / Medium / High.
+        speed_count: 100
+        percentage: >-
+          {% if is_state('select.vanee_v150h75ns_erv_proxy_erv_operating_mode', 'Standby (OFF)') %}0
+          {% else %}{{ {1: 33, 2: 66, 3: 100}.get(states('number.vanee_v150h75ns_erv_proxy_erv_fan_speed') | int(1), 33) }}
+          {% endif %}
+        # Only "auto" reaches Google (Matter Auto). The others are for the HA fan card.
+        preset_modes:
+          - "auto"
+          - "intermittent"
+          - "away"
+          - "turbo"
+        preset_mode: >-
+          {{ {'SMART / Auto': 'auto', 'Intermittent (Timer)': 'intermittent',
+              'Away': 'away', 'Turbo / Override': 'turbo'}
+             .get(states('select.vanee_v150h75ns_erv_proxy_erv_operating_mode')) }}
+        # Filter life goes to Matter through the Matter Hub mapping (Filter Life Sensor =
+        # sensor.erv_filter_life), which works on every HA version.
+        # HA calls turn_on first and then set_percentage / set_preset_mode when those are given,
+        # so turn_on only acts when it comes with neither.
+        turn_on:
+          - if:
+              - condition: template
+                value_template: "{{ percentage is none and preset_mode is none }}"
+            then:
+              - action: script.turn_on
+                target:
+                  entity_id: script.erv_fan_command
+                data:
+                  variables:
+                    cmd: "power_on"
+        turn_off:
+          - action: script.turn_on
+            target:
+              entity_id: script.erv_fan_command
+            data:
+              variables:
+                cmd: "off"
+        set_percentage:
+          - action: script.turn_on
+            target:
+              entity_id: script.erv_fan_command
+            data:
+              variables:
+                cmd: "percentage"
+                value: "{{ percentage }}"
+        set_preset_mode:
+          - action: script.turn_on
+            target:
+              entity_id: script.erv_fan_command
+            data:
+              variables:
+                cmd: "preset"
+                value: "{{ preset_mode }}"
+
+script:
+  # One queue for every command, so a Matter "on" followed right away by "set speed"
+  # runs in order instead of racing.
+  erv_fan_command:
+    alias: "ERV fan command"
+    mode: queued
+    max: 10
+    fields:
+      cmd:
+        description: "off | power_on | percentage | preset"
+      value:
+        description: "percentage (0-100) or preset name"
+    variables:
+      sel: select.vanee_v150h75ns_erv_proxy_erv_operating_mode
+      spd: number.vanee_v150h75ns_erv_proxy_erv_fan_speed
+      cur: "{{ states(sel) }}"
+      val: "{{ value | default('') }}"
+      last: >-
+        {% set l = states('sensor.erv_last_mode') %}
+        {{ l if l in ['Intermittent (Timer)', 'Continuous (LOW)', 'Continuous (MED)',
+                      'Continuous (HIGH)', 'SMART / Auto'] else 'SMART / Auto' }}
+      # From OFF, speed and power-on requests continue from the last normal mode.
+      base: "{{ last if cur == 'Standby (OFF)' else cur }}"
+      # Slider zones: 0-1 % off, 2-33 % low, 34-67 % medium, 68-100 % high.
+      # (Google's "medium" voice command arrives as 67 %, so medium ends at 67.)
+      level: >-
+        {% set p = val | float(0) if cmd == 'percentage' else 0 %}
+        {{ 0 if p <= 1 else (1 if p <= 33 else (2 if p <= 67 else 3)) }}
+      continuous: "{{ {1: 'Continuous (LOW)', 2: 'Continuous (MED)', 3: 'Continuous (HIGH)'}.get(level | int, 'Continuous (LOW)') }}"
+      preset_target: >-
+        {{ {'auto': 'SMART / Auto', 'intermittent': 'Intermittent (Timer)',
+            'away': 'Away', 'turbo': 'Turbo / Override'}.get(val | string | lower, '') }}
+    sequence:
+      - choose:
+          # ── off ──
+          - conditions: "{{ cmd == 'off' or (cmd == 'percentage' and level | int == 0) }}"
+            sequence:
+              - action: select.select_option
+                target: { entity_id: "{{ sel }}" }
+                data: { option: "Standby (OFF)" }
+
+          # ── power on without a speed: back to the last normal mode ──
+          - conditions: "{{ cmd == 'power_on' }}"
+            sequence:
+              - if: "{{ cur == 'Standby (OFF)' }}"
+                then:
+                  - action: select.select_option
+                    target: { entity_id: "{{ sel }}" }
+                    data: { option: "{{ last }}" }
+
+          # ── presets (auto / intermittent / away / turbo) ──
+          - conditions: "{{ cmd == 'preset' and preset_target != '' }}"
+            sequence:
+              - if: "{{ cur != preset_target }}"
+                then:
+                  - action: select.select_option
+                    target: { entity_id: "{{ sel }}" }
+                    data: { option: "{{ preset_target }}" }
+
+          # ── speed while (or returning to) Intermittent: keep Intermittent, change its speed ──
+          - conditions: "{{ cmd == 'percentage' and base == 'Intermittent (Timer)' }}"
+            sequence:
+              - if: "{{ cur != 'Intermittent (Timer)' }}"
+                then:
+                  - action: select.select_option
+                    target: { entity_id: "{{ sel }}" }
+                    data: { option: "Intermittent (Timer)" }
+                  - wait_template: "{{ is_state(sel, 'Intermittent (Timer)') }}"
+                    timeout: "00:00:15"
+                    continue_on_timeout: false
+              - if: "{{ states(spd) | int(0) != level | int }}"
+                then:
+                  - action: number.set_value
+                    target: { entity_id: "{{ spd }}" }
+                    data: { value: "{{ level }}" }
+
+          # ── power on from OFF into SMART: the ERV picks the speed, so just restore SMART ──
+          - conditions: "{{ cmd == 'percentage' and cur == 'Standby (OFF)' and base == 'SMART / Auto' }}"
+            sequence:
+              - action: select.select_option
+                target: { entity_id: "{{ sel }}" }
+                data: { option: "SMART / Auto" }
+
+          # ── any other speed request: Continuous at that speed ──
+          - conditions: "{{ cmd == 'percentage' }}"
+            sequence:
+              - if: "{{ cur != continuous }}"
+                then:
+                  - action: select.select_option
+                    target: { entity_id: "{{ sel }}" }
+                    data: { option: "{{ continuous }}" }
