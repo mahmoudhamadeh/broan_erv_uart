@@ -40,6 +40,145 @@ struct SentFrameRecord {
   uint32_t sent_ms{0};
 };
 
+// ---------------------------------------------------------------------------------------------
+// "Nest in charge" decisions (used from the YAML). Pure logic, no bus access, so it is testable
+// on a PC. Mode bytes: 0x01 Standby, 0x09 Continuous LOW, 0x0B MED, 0x0A HIGH.
+//
+//  - While the Nest calls: speed by outdoor temperature (>= 5 C HIGH, 5..-10 C MED, < -10 C LOW,
+//    1 C either side of each threshold as hysteresis). Call ends: Standby.
+//  - Outdoor temperature = intake temperature, but only once both fans have moved air for 2 min
+//    (when idle the intake sensor reads warm air sitting in the unit). Until then: MED when starting
+//    from Standby or another mode; a Continuous speed already running is kept (a reboot during a
+//    call changes nothing). The first decision after the temperature becomes known is applied at
+//    once (it replaces a guess; the 5-min limit is only there to stop flapping).
+//  - Call edges (and enabling "Nest in charge", boot, end of a bypass) act at once. During a call
+//    the speed is re-checked periodically and changed at most every 5 min, and only while the ERV
+//    is still in the mode we set (a manual change is respected until the next call edge).
+//  - Nothing changes while the ERV is defrosting; the pending change runs when the defrost ends
+//    (at most 15 min later), so a defrost is never cut short by Standby.
+// ---------------------------------------------------------------------------------------------
+class NestVentController {
+ public:
+  static constexpr uint32_t SETTLE_MS = 120000;
+  static constexpr uint32_t MIN_CHANGE_MS = 300000;
+  static constexpr uint32_t DEFROST_MAX_HOLD_MS = 900000;
+
+  // Call every ~10 s with the offset-corrected intake temperature and both airflows.
+  void observe(uint32_t now, float intake_c, float supply_cfm, float exhaust_cfm) {
+    const bool flowing = !std::isnan(intake_c) && !std::isnan(supply_cfm) && !std::isnan(exhaust_cfm) &&
+                         supply_cfm > 20.0f && exhaust_cfm > 20.0f;
+    if (flowing && !this->flowing_) this->flow_since_ = now;
+    this->flowing_ = flowing;
+    if (flowing && now - this->flow_since_ >= SETTLE_MS) {
+      if (std::isnan(this->outdoor_c_)) {
+        ESP_LOGI("nest", "Outdoor temperature known: %.1f C (intake, fans running 2 min)", intake_c);
+        this->fresh_outdoor_ = true;   // next speed decision may skip the 5-min limit once
+      }
+      this->outdoor_c_ = intake_c;
+    }
+  }
+
+  // Returns the mode byte to write now, or 0 for "nothing to do".
+  uint8_t decide(uint32_t now, bool call, bool edge, uint8_t current_mode, bool defrost) {
+    if (defrost && !this->defrost_prev_) this->defrost_since_ = now;
+    this->defrost_prev_ = defrost;
+    const bool hold = defrost && (now - this->defrost_since_ < DEFROST_MAX_HOLD_MS);
+    const bool continuous = current_mode == 0x09 || current_mode == 0x0B || current_mode == 0x0A;
+    uint8_t target;
+    if (!call) target = 0x01;
+    else if (std::isnan(this->outdoor_c_) && continuous) target = current_mode;   // keep it until known
+    else target = this->band_mode_();
+
+    if (edge) this->pending_ = true;
+    if (this->pending_) {
+      if (hold) {
+        if (!this->hold_logged_) {
+          ESP_LOGI("nest", "Defrost running: %s waits until it ends", mode_name(target));
+          this->hold_logged_ = true;
+        }
+        return 0;
+      }
+      this->pending_ = false;
+      this->hold_logged_ = false;
+      this->last_target_ = target;
+      this->last_change_ms_ = now;
+      if (current_mode == target) return 0;
+      ESP_LOGI("nest", "Ventilation call %s -> %s (outdoor %s)", call ? "ON" : "OFF", mode_name(target),
+               this->outdoor_str_().c_str());
+      return target;
+    }
+
+    // Periodic re-check: only adjust the speed of a call we are running ourselves.
+    if (!call || this->last_target_ == 0x01 || current_mode != this->last_target_) return 0;
+    if (target == current_mode) {
+      this->fresh_outdoor_ = false;   // the guess was right: nothing to correct
+      return 0;
+    }
+    if (hold) return 0;
+    if (!this->fresh_outdoor_ && now - this->last_change_ms_ < MIN_CHANGE_MS) return 0;
+    ESP_LOGI("nest", "Outdoor %s -> speed %s%s", this->outdoor_str_().c_str(), mode_name(target),
+             this->fresh_outdoor_ ? " (outdoor temperature just learned)" : "");
+    this->fresh_outdoor_ = false;
+    this->last_target_ = target;
+    this->last_change_ms_ = now;
+    return target;
+  }
+
+  float outdoor_c() const { return this->outdoor_c_; }
+  bool pending() const { return this->pending_; }
+
+  static const char *mode_name(uint8_t m) {
+    switch (m) {
+      case 0x01: return "Standby";
+      case 0x09: return "Continuous LOW";
+      case 0x0B: return "Continuous MED";
+      case 0x0A: return "Continuous HIGH";
+      default:   return "?";
+    }
+  }
+
+ protected:
+  uint8_t band_mode_() {
+    const float t = this->outdoor_c_;
+    if (std::isnan(t)) {
+      this->band_ = 1;                // MED until the outdoor temperature is known
+      this->band_provisional_ = true;
+    } else if (this->band_ < 0 || this->band_provisional_) {
+      this->band_ = t >= 5.0f ? 0 : (t >= -10.0f ? 1 : 2);
+      this->band_provisional_ = false;
+    } else if (this->band_ == 0 && t < 4.0f) {
+      this->band_ = 1;
+    } else if (this->band_ == 1 && t >= 6.0f) {
+      this->band_ = 0;
+    } else if (this->band_ == 1 && t < -11.0f) {
+      this->band_ = 2;
+    } else if (this->band_ == 2 && t >= -9.0f) {
+      this->band_ = 1;
+    }
+    return this->band_ == 0 ? 0x0A : (this->band_ == 1 ? 0x0B : 0x09);
+  }
+
+  std::string outdoor_str_() const {
+    if (std::isnan(this->outdoor_c_)) return "unknown";
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%.1f C", this->outdoor_c_);
+    return buf;
+  }
+
+  float outdoor_c_{NAN};
+  bool flowing_{false};
+  uint32_t flow_since_{0};
+  int band_{-1};                 // 0 HIGH, 1 MED, 2 LOW
+  bool band_provisional_{false};
+  bool fresh_outdoor_{false};    // outdoor temperature just learned: first correction skips the 5-min limit
+  bool pending_{false};
+  bool hold_logged_{false};
+  uint8_t last_target_{0};
+  uint32_t last_change_ms_{0};
+  bool defrost_prev_{false};
+  uint32_t defrost_since_{0};
+};
+
 class BroanErvProxy : public Component {
  public:
   void set_uart_erv(uart::UARTComponent *u) { this->uart_a_ = u; }
@@ -287,8 +426,90 @@ class BroanErvProxy : public Component {
     this->dump_next_key_ = 0;
   }
 
+  // ---- Relay link control (D-229 on G7). Called from YAML around every relay switch. ----
+  //
+  // Relays OFF = the ESP is physically off both buses (screen wired straight to the ERV).
+  // While the link is down the proxy sends nothing, refuses HA writes and only discards RX noise.
+
+  // Call right BEFORE the relays drop. Stops all transmitting, then waits (max max_ms) until both
+  // lines have been quiet for 12 ms, so the contacts open between frames instead of mid-frame.
+  // Our own frames are never cut: write_array() + flush() return only once the last byte is out.
+  void quiesce_for_disconnect(uint32_t max_ms = 150) {
+    this->link_active_ = false;
+    this->pending_tx_a_.clear();
+    this->pending_tx_b_.clear();
+    const uint32_t start = millis();
+    uint32_t last_byte = start;
+    uint8_t b;
+    while (millis() - start < max_ms) {
+      bool got = false;
+      while (this->uart_a_ != nullptr && this->uart_a_->available() && this->uart_a_->read_byte(&b)) got = true;
+      while (this->uart_b_ != nullptr && this->uart_b_->available() && this->uart_b_->read_byte(&b)) got = true;
+      const uint32_t t = millis();
+      if (got) last_byte = t;
+      else if (t - last_byte >= 12) break;   // both buses idle between frames
+      delay(1);
+    }
+    ESP_LOGI(TAG, "[Link] Buses quiet after %u ms -> relays can drop", (unsigned) (millis() - start));
+  }
+
+  // Call right AFTER the relays switch (true = ESP back in the path). Going up resets both buses to
+  // their start-up state: the screen is not served until Bus A has re-read the ERV, so it never
+  // sees values from before the bypass (the screen may have changed modes while it was direct).
+  void set_link_active(bool on) {
+    const uint32_t now = millis();
+    this->link_active_ = on;
+    this->pending_tx_a_.clear();
+    this->pending_tx_b_.clear();
+    this->rx_buf_a_.clear();
+    this->rx_buf_b_.clear();
+    this->urgent_poll_keys_.clear();
+    this->refresh_keys_.clear();
+    this->dynamic_extra_keys_.clear();
+    this->bus_b_held_read_keys_.clear();
+    // Writes queued before the bypass are dropped: they would land on top of whatever the screen
+    // set while it was in control.
+    this->bus_a_write_queue_.clear();
+    this->write_guard_.clear();
+    if (!on) {
+      ESP_LOGI(TAG, "[Link] DOWN: proxy off the buses (screen <-> ERV direct)");
+      return;
+    }
+    this->bus_a_state_ = BusAState::LISTEN_FOR_ERV;
+    this->bus_a_last_ms_ = now;
+    this->bus_a_initial_sweep_done_ = false;
+    this->current_batch_idx_ = 0;
+    this->resync_pending_ = this->boot_.sweep != 0;   // not the first link-up since boot
+    this->bus_b_state_ = BusBState::WAIT_BUS_A_INIT;
+    this->bus_b_last_ms_ = now;
+    this->bus_b_missed_offers_ = 0;
+    this->bus_b_ping_candidate_ = 0x12;
+    this->last_rx_a_ms_ = now;
+    this->last_rx_b_ms_ = now;
+    this->link_up_ms_ = now;
+    this->link_up_cycles_ = this->bus_a_cycles_;
+    ESP_LOGI(TAG, "[Link] UP: re-reading the ERV before serving the screen");
+  }
+
+  bool is_link_active() const { return this->link_active_; }
+
   void loop() override {
     const uint32_t now = millis();
+
+    if (!this->link_active_) {
+      // Off the buses: just discard anything the UARTs pick up (relay bounce, noise).
+      uint8_t b;
+      while (this->uart_a_ != nullptr && this->uart_a_->available()) this->uart_a_->read_byte(&b);
+      while (this->uart_b_ != nullptr && this->uart_b_->available()) this->uart_b_->read_byte(&b);
+      this->rx_buf_a_.clear();
+      this->rx_buf_b_.clear();
+      if (now - this->last_summary_ms_ >= 15000) {
+        this->last_summary_ms_ = now;
+        ESP_LOGI(TAG, "PROXY | Link DOWN (bypass): screen <-> ERV direct, showing last known values");
+      }
+      if (this->dump_active_) this->dump_some_registers_();
+      return;
+    }
 
     // ---- BUS A (Real ERV) RX + TX + State Machine ----
     this->drain_uart_(this->uart_a_, this->rx_buf_a_, this->last_rx_a_ms_, this->bus_a_rx_bytes_, now);
@@ -297,7 +518,8 @@ class BroanErvProxy : public Component {
     }
     this->process_rx_a_(now);
 
-    if (!this->pending_tx_a_.empty() && (now >= this->tx_ready_a_ms_)) {
+    // Signed difference: still correct when millis() wraps after 49.7 days.
+    if (!this->pending_tx_a_.empty() && (int32_t) (now - this->tx_ready_a_ms_) >= 0) {
       this->uart_a_->write_array(this->pending_tx_a_);
       this->uart_a_->flush();
       uint32_t done_ms = millis();
@@ -311,9 +533,14 @@ class BroanErvProxy : public Component {
     // ---- BUS B (VTTOUCHW Wall Screen) RX + TX + State Machine ----
     this->drain_uart_(this->uart_b_, this->rx_buf_b_, this->last_rx_b_ms_, this->bus_b_rx_bytes_, now);
     if (!this->rx_buf_b_.empty() && (now - this->last_rx_b_ms_ > 60)) {
-      ESP_LOGW(TAG, "[Bus B] Dropping %u unparsed RX bytes: [%s]",
-               (unsigned) this->rx_buf_b_.size(),
-               format_hex_(this->rx_buf_b_.data(), std::min<size_t>(this->rx_buf_b_.size(), 16)).c_str());
+      // Right after the relays close, a fragment of a frame already on the wire is expected.
+      if (now - this->link_up_ms_ < 200) {
+        ESP_LOGD(TAG, "[Bus B] Dropping %u bytes caught as the relays closed", (unsigned) this->rx_buf_b_.size());
+      } else {
+        ESP_LOGW(TAG, "[Bus B] Dropping %u unparsed RX bytes: [%s]",
+                 (unsigned) this->rx_buf_b_.size(),
+                 format_hex_(this->rx_buf_b_.data(), std::min<size_t>(this->rx_buf_b_.size(), 16)).c_str());
+      }
       this->rx_buf_b_.clear();
     }
     this->process_rx_b_(now);
@@ -322,8 +549,8 @@ class BroanErvProxy : public Component {
     // (that collision is what corrupts its frames and makes it fall back to Ping re-discovery).
     bool bus_b_busy = this->uart_b_->available() > 0 || !this->rx_buf_b_.empty() ||
                       (millis() - this->last_rx_b_ms_ < 3);
-    if (!this->pending_tx_b_.empty() && (now >= this->tx_ready_b_ms_) &&
-        (!bus_b_busy || now - this->tx_ready_b_ms_ > 100)) {
+    const int32_t b_late_ms = (int32_t) (now - this->tx_ready_b_ms_);   // wrap-safe
+    if (!this->pending_tx_b_.empty() && b_late_ms >= 0 && (!bus_b_busy || b_late_ms > 100)) {
       if (bus_b_busy) ESP_LOGW(TAG, "[Bus B] Line still busy after 100 ms, sending anyway");
       this->uart_b_->write_array(this->pending_tx_b_);
       this->uart_b_->flush();
@@ -397,6 +624,12 @@ class BroanErvProxy : public Component {
   uint32_t bus_a_chk_err_{0};
   uint32_t bus_a_rx_bytes_{0};
   bool bus_a_initial_sweep_done_{false};
+  std::map<uint16_t, uint32_t> watch_last_ms_;   // change watcher: last log time per register
+  uint32_t watch_suppressed_{0};                  // changes not logged (rate limit) since the last status line
+  bool link_active_{false};
+  uint32_t link_up_ms_{0};
+  uint32_t link_up_cycles_{0};   // Bus A cycle count at link up       // when the relays last connected (fragment caught then is expected)      // off until YAML switches the relays on (set_link_active(true))
+  bool resync_pending_{false};   // next sweep follows a bypass: re-read non-polled registers too
   std::vector<uint8_t> rx_buf_a_;
   std::vector<uint8_t> pending_tx_a_;
   std::deque<SentFrameRecord> recent_tx_a_;
@@ -508,7 +741,15 @@ class BroanErvProxy : public Component {
     return false;
   }
 
+  // The length field is one byte: a payload over this would wrap it and put a malformed frame on the bus.
+  static constexpr size_t MAX_PAYLOAD = 250;
+
   void queue_frame_a_(uint8_t target, const std::vector<uint8_t> &payload, uint32_t delay_ms = 3) {
+    if (payload.size() > MAX_PAYLOAD) {
+      ESP_LOGW(TAG, "[Bus A] Payload of %u bytes to 0x%02X is too long, frame dropped",
+               (unsigned) payload.size(), target);
+      return;
+    }
     std::vector<uint8_t> frame;
     frame.reserve(payload.size() + 7);
     frame.push_back(0x01);
@@ -524,6 +765,11 @@ class BroanErvProxy : public Component {
   }
 
   void queue_frame_b_(uint8_t target, const std::vector<uint8_t> &payload, uint32_t delay_ms = 3) {
+    if (payload.size() > MAX_PAYLOAD) {
+      ESP_LOGW(TAG, "[Bus B] Payload of %u bytes to 0x%02X is too long, frame dropped",
+               (unsigned) payload.size(), target);
+      return;
+    }
     std::vector<uint8_t> frame;
     frame.reserve(payload.size() + 7);
     frame.push_back(0x01);
@@ -540,6 +786,10 @@ class BroanErvProxy : public Component {
 
   void enqueue_bus_a_write_(uint16_t key, const std::vector<uint8_t> &val) {
     if (key == 0x0050) return;
+    if (!this->link_active_) {
+      ESP_LOGW(TAG, "[HA -> ERV] Write to 0x%04X ignored: proxy is bypassed (screen in control)", key);
+      return;
+    }
     if (!val.empty()) {
       // Show the new value right away and ignore older ERV values until it applies the write
       // (safety expiry 3 s if the write is ever lost).
@@ -715,6 +965,22 @@ class BroanErvProxy : public Component {
             ESP_LOGI(TAG, "[Bus A] 0x%04X: ERV value differs from the built-in starting value (now using the ERV's)", k);
             if (this->boot_.differs.size() < 24) this->boot_.differs.push_back(k);
           }
+          // Change watcher: any other polled register that changes is logged (max once a minute per
+          // register). Meant to catch status flags we haven't mapped yet, e.g. defrost on a cold night.
+          if (this->bus_a_initial_sweep_done_ && rec.fetched_from_erv && !rec.value.empty() &&
+              this->in_poll_batches_(k) && !watch_ignored_(k) &&
+              (rec.value.size() != vlen || !std::equal(rec.value.begin(), rec.value.end(), payload.begin() + idx))) {
+            uint32_t &last = this->watch_last_ms_[k];
+            if (last == 0 || now - last >= 60000) {
+              last = now;
+              ESP_LOGI(TAG, "[Watch] 0x%04X: %s -> %s | intake %.1f C (raw) | supply %.1f / exhaust %.1f CFM", k,
+                       format_hex_(rec.value.data(), std::min<size_t>(rec.value.size(), 8)).c_str(),
+                       format_hex_(payload.data() + idx, std::min<size_t>(vlen, 8)).c_str(),
+                       this->get_f32_reg_(0x01E0), this->get_f32_reg_(0x0510), this->get_f32_reg_(0x0610));
+            } else {
+              this->watch_suppressed_++;
+            }
+          }
           if (k == 0x0020 && vlen == 1) {
             if (payload[idx] == 0x14) this->boot_.startup_mode = true;
             else if (this->boot_.startup_mode && !this->boot_.startup_end) this->boot_.startup_end = now;
@@ -828,17 +1094,27 @@ class BroanErvProxy : public Component {
             // Starting values for registers outside the poll batches (boot-only IDs, installer menu)
             // are read once from the ERV, so the cache holds this unit's live values from the start.
             // 0x1600 is the fault-log clear trigger: never touched by the proxy itself.
+            // After a bypass, every register outside the poll batches is re-read too (installer and
+            // humidity settings may have been changed on the screen while it talked to the ERV directly).
+            const bool resync = this->resync_pending_;
+            this->resync_pending_ = false;
             size_t n = 0;
             for (const auto &kv : this->regs_) {
-              if (!kv.second.fetched_from_erv && kv.first != 0x1600 && kv.first != 0x0450 && kv.first != 0x0550) {
+              if ((resync ? !this->in_poll_batches_(kv.first) : !kv.second.fetched_from_erv) &&
+                  kv.first != 0x1600 && kv.first != 0x0450 && kv.first != 0x0550) {
                 this->refresh_keys_.insert(kv.first);
                 n++;
               }
             }
-            this->boot_.sweep = now;
-            this->boot_.refreshed = n;
-            ESP_LOGI(TAG, "[Bus A] Initial register sweep from real ERV complete! Enabling Bus B. "
-                          "Reading %u more starting-value registers once.", (unsigned) n);
+            if (resync) {
+              ESP_LOGI(TAG, "[Bus A] Re-sync after bypass: poll sweep done, re-reading %u more registers "
+                            "before the screen is served.", (unsigned) n);
+            } else {
+              this->boot_.sweep = now;
+              this->boot_.refreshed = n;
+              ESP_LOGI(TAG, "[Bus A] Initial register sweep from real ERV complete! Enabling Bus B. "
+                            "Reading %u more starting-value registers once.", (unsigned) n);
+            }
           }
         }
 
@@ -904,6 +1180,10 @@ class BroanErvProxy : public Component {
       this->rx_buf_b_.erase(this->rx_buf_b_.begin(), this->rx_buf_b_.begin() + total_len);
 
       if (target == 0x10) {
+        // Until the cache holds fresh ERV values (boot, or right after a bypass while the screen may
+        // still be mid-turn from talking to the ERV directly) the screen gets no answers at all.
+        // It times out and waits for our token offer, which comes as soon as the re-read is done.
+        if (this->bus_b_state_ == BusBState::WAIT_BUS_A_INIT) continue;
         this->handle_frame_from_wall_(sender, payload, now);
       }
     }
@@ -1052,7 +1332,20 @@ class BroanErvProxy : public Component {
 
     switch (this->bus_b_state_) {
       case BusBState::WAIT_BUS_A_INIT: {
-        if (this->bus_a_initial_sweep_done_ || (now - this->bus_b_last_ms_ >= 1500)) {
+        // Serve the screen only once the cache holds fresh ERV values: the poll sweep is done and the
+        // one-off re-reads are through. The 1.5 s fallback keeps the screen from waiting forever.
+        const bool ready = this->bus_a_initial_sweep_done_ && this->refresh_keys_.empty();
+        if (ready || (now - this->bus_b_last_ms_ >= 1500)) {
+          if (ready) {
+            ESP_LOGI(TAG, "[Bus B] Cache ready %u ms after link up (%u ERV turns)",
+                     (unsigned) (now - this->link_up_ms_), (unsigned) (this->bus_a_cycles_ - this->link_up_cycles_));
+          } else {
+            ESP_LOGW(TAG, "[Bus B] Serving the screen after the 1.5 s fallback: sweep %s, %u one-off reads and "
+                          "%u urgent reads still pending, %u ERV turns since link up, Bus A state %d",
+                     this->bus_a_initial_sweep_done_ ? "done" : "NOT done", (unsigned) this->refresh_keys_.size(),
+                     (unsigned) this->urgent_poll_keys_.size(),
+                     (unsigned) (this->bus_a_cycles_ - this->link_up_cycles_), (int) this->bus_a_state_);
+          }
           ESP_LOGI(TAG, "[Bus B] Starting VTTOUCHW discovery/token loop (target 0x12)");
           this->bus_b_missed_offers_ = 0;
           this->bus_b_state_ = BusBState::OFFER_TOKEN;
@@ -1155,6 +1448,19 @@ class BroanErvProxy : public Component {
     this->poll_batches_.push_back({
       0x1200, 0x1400, 0x1A00, 0x0AF0, 0x0510, 0x0610, 0x0100
     });
+  }
+
+  // Registers the change watcher skips: they move all the time (airflow, temperatures, humidity,
+  // filter countdown) or already have their own "[ERV state]" line.
+  static bool watch_ignored_(uint16_t k) {
+    switch (k) {
+      case 0x0510: case 0x0610: case 0x01E0: case 0x0450: case 0x0550: case 0x0830:
+      case 0x1400:   // counts up once a second (ERV time since power-on)
+      case 0x0020: case 0x0120: case 0x0620: case 0x0720: case 0x0E22: case 0x0322: case 0x0F22: case 0x1022:
+        return true;
+      default:
+        return false;
+    }
   }
 
   bool in_poll_batches_(uint16_t key) const {
@@ -1296,10 +1602,13 @@ class BroanErvProxy : public Component {
   }
 
   void publish_sensors_() {
-    if (this->wall_humidity_sensor_ != nullptr) {
+    // Room humidity / temperature come from the screen (it writes them), not from the ERV. Until it
+    // has, the cache only holds the built-in starting values, so nothing is published (HA keeps the
+    // last real value through a reboot).
+    if (this->wall_humidity_sensor_ != nullptr && this->regs_[0x0450].write_count_wall > 0) {
       this->wall_humidity_sensor_->publish_state(this->get_f32_reg_(0x0450));
     }
-    if (this->wall_temp_sensor_ != nullptr) {
+    if (this->wall_temp_sensor_ != nullptr && this->regs_[0x0550].write_count_wall > 0) {
       this->wall_temp_sensor_->publish_state(this->get_f32_reg_(0x0550));
     }
     if (this->erv_temp_sensor_ != nullptr) {
@@ -1358,6 +1667,11 @@ class BroanErvProxy : public Component {
     if (millis() - this->boot_.t0 < 180000) this->print_boot_report_();
     ESP_LOGI(TAG, "       BusB token accept: slowest %u ms, %u slower than 50 ms (last 15 s)",
              (unsigned) this->bus_b_accept_max_ms_, (unsigned) this->bus_b_accept_late_);
+    if (this->watch_suppressed_ > 0) {
+      ESP_LOGI(TAG, "       Watch: %u more register changes not logged (max 1 per register per minute)",
+               (unsigned) this->watch_suppressed_);
+      this->watch_suppressed_ = 0;
+    }
     if (this->bus_b_holds_ > 0) {
       ESP_LOGI(TAG, "       BusB cache-miss holds: %u, longest %u ms, %u timed out (last 15 s)",
                (unsigned) this->bus_b_holds_, (unsigned) this->bus_b_hold_max_ms_, (unsigned) this->bus_b_hold_timeouts_);
